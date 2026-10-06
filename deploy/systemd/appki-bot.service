@@ -1,0 +1,31 @@
+[Unit]
+Description=Appki Telegram bot
+After=network-online.target appki-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=appki
+Group=appki
+WorkingDirectory=/opt/appki/current
+EnvironmentFile=/etc/appki/appki.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/appki/venv/bin/python -m appki.bot
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/appki
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+TimeoutStopSec=35
+
+[Install]
+WantedBy=multi-user.target
