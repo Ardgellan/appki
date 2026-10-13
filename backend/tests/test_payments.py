@@ -61,9 +61,9 @@ def validate(value, **kwargs):
     return validate_payment(value, **options)
 
 
-def client_for(handler):
+def client_for(handler, *, mode="test"):
     injected = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return YooKassaClient(SHOP_ID, SECRET, client=injected), injected
+    return YooKassaClient(SHOP_ID, mode + "_not_a_real_key", mode=mode, client=injected), injected
 
 
 @pytest.mark.parametrize("status,result", [("pending", "pending"), ("succeeded", "succeeded"), ("canceled", "canceled"), ("waiting_for_capture", "pending")])
@@ -155,32 +155,40 @@ def test_bad_configuration_fails_before_any_request(options):
 
 
 @pytest.mark.asyncio
-async def test_create_sends_official_authenticated_request_and_reuses_exact_key():
+@pytest.mark.parametrize("mode,payment_method_data", [("test", None), ("live", {"type": "sbp"})])
+async def test_create_uses_sbp_only_live_and_reuses_exact_key(mode, payment_method_data):
     requests = []
+    provider_payment = payment(test=mode == "test")
+    if mode == "live":
+        provider_payment["payment_method"] = {"type": "sbp", "id": PAYMENT_ID, "saved": False}
+        provider_payment["confirmation"]["confirmation_url"] = "https://yoomoney.ru/checkout/payments/sbp?orderId=" + PAYMENT_ID
 
     def handle(request):
         requests.append(request)
-        return httpx.Response(200, json=payment())
+        return httpx.Response(200, json=provider_payment)
 
-    client, transport_client = client_for(handle)
+    client, transport_client = client_for(handle, mode=mode)
     async with transport_client:
         first = await client.create_payment(**CREATE_ARGS)
         second = await client.create_payment(**CREATE_ARGS)
-    assert first == second == payment()
+    assert first == second == provider_payment
     assert len(requests) == 2
-    expected_auth = "Basic " + base64.b64encode(f"{SHOP_ID}:{SECRET}".encode()).decode()
+    expected_auth = "Basic " + base64.b64encode(f"{SHOP_ID}:{mode}_not_a_real_key".encode()).decode()
+    expected_payload = {
+        "amount": {"value": AMOUNT, "currency": "RUB"},
+        "capture": True,
+        "confirmation": {"type": "redirect", "return_url": CREATE_ARGS["return_url"]},
+        "description": CREATE_ARGS["description"],
+        "metadata": {"order_id": ORDER_ID},
+    }
+    if payment_method_data is not None:
+        expected_payload["payment_method_data"] = payment_method_data
     for request in requests:
         assert str(request.url) == API_BASE + "/payments"
         assert request.method == "POST"
         assert request.headers["Authorization"] == expected_auth
         assert request.headers["Idempotence-Key"] == "purchase-123"
-        assert json.loads(request.content) == {
-            "amount": {"value": AMOUNT, "currency": "RUB"},
-            "capture": True,
-            "confirmation": {"type": "redirect", "return_url": CREATE_ARGS["return_url"]},
-            "description": CREATE_ARGS["description"],
-            "metadata": {"order_id": ORDER_ID},
-        }
+        assert json.loads(request.content) == expected_payload
 
 
 @pytest.mark.asyncio

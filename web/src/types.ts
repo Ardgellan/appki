@@ -36,6 +36,18 @@ export interface Order {
   paid_at?: string;
   test: boolean;
   can_install: boolean;
+  items?: OrderItem[];
+  total_rub?: string;
+}
+export interface OrderItem {
+  app_slug: string;
+  app_title: string;
+  amount_rub: string;
+  installed: boolean;
+  activated: boolean;
+  can_install: boolean;
+  installed_at?: string | null;
+  activated_at?: string | null;
 }
 export interface Activation {
   mode: "manual" | "credentials";

@@ -24,9 +24,15 @@ CREATE TABLE IF NOT EXISTS orders (
  test INTEGER NOT NULL CHECK(test IN (0,1)), UNIQUE(user_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS orders_user ON orders(user_id, created_at);
+CREATE TABLE IF NOT EXISTS order_items (
+ order_id TEXT NOT NULL REFERENCES orders(id), app_slug TEXT NOT NULL,
+ app_title TEXT NOT NULL, amount_rub TEXT NOT NULL,
+ installed_at INTEGER, activated_at INTEGER,
+ PRIMARY KEY(order_id, app_slug), CHECK(activated_at IS NULL OR installed_at IS NOT NULL)
+);
 CREATE TABLE IF NOT EXISTS install_grants (
  token_hash TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id), expires_at INTEGER NOT NULL,
- revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1))
+ revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)), app_slug TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS grants_expiry ON install_grants(expires_at);
 '''
@@ -41,6 +47,16 @@ class Database:
         with self.connection() as conn:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.executescript(SCHEMA)
+        with self.connection(write=True) as conn:
+            # Preserve single-app orders and their existing installation links in place.
+            conn.execute('''INSERT OR IGNORE INTO order_items (order_id,app_slug,app_title,amount_rub)
+                SELECT id,app_slug,app_title,amount_rub FROM orders''')
+            columns = {row['name'] for row in conn.execute('PRAGMA table_info(install_grants)')}
+            if 'app_slug' not in columns:
+                conn.execute('ALTER TABLE install_grants ADD COLUMN app_slug TEXT')
+            conn.execute('''UPDATE install_grants SET app_slug=(
+                SELECT app_slug FROM orders WHERE orders.id=install_grants.order_id)
+                WHERE app_slug IS NULL''')
         self.path.chmod(0o600)
 
     @contextmanager

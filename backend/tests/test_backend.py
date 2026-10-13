@@ -1,8 +1,10 @@
 import copy
 import hashlib
+import html
 import hmac
 import json
 import plistlib
+import sqlite3
 import time
 import uuid
 from urllib.parse import urlencode, urlsplit
@@ -13,7 +15,9 @@ import pytest
 
 from appki.auth import InvalidTelegramData, token_hash, validate_init_data
 from appki.config import Settings
+from appki.db import Database
 from appki.main import create_app
+from appki.ota import IPAFile
 from appki.payments import PaymentProviderError
 
 BOT_TOKEN = '123456:local-test-only-token'
@@ -386,3 +390,231 @@ def test_order_retry_endpoint_recovers_uncertain_creation_without_second_order(c
     assert recovered.json()['id'] == result['id'] and recovered.json()['payment_url']
     assert len(set(fake.keys)) == 1
     assert len(client.get('/api/orders', headers=owner).json()['items']) == 1
+
+
+def test_cart_checkout_preserves_legacy_contract_and_rejects_invalid_items(configured):
+    cfg, fake, app, client = configured
+    headers = login(client)
+    payload = {'app_slugs': ['happ'], 'request_id': 'cart-checkout', 'expected_amount_rub': '1.00'}
+    response = client.post('/api/orders', headers=headers, json=payload)
+    assert response.status_code == 200
+    result = response.json()
+    assert result['app_slug'] == 'happ' and result['app_title'] == 'Happ'
+    assert result['amount_rub'] == result['total_rub'] == '1.00'
+    assert result['items'] == [{'app_slug': 'happ', 'app_title': 'Happ', 'amount_rub': '1.00',
+                                'installed': False, 'activated': False, 'installed_at': None,
+                                'activated_at': None, 'can_install': False}]
+    assert order(client, headers, 'cart-checkout')['id'] == result['id']
+    assert len(fake.keys) == 1
+    for selection in [{}, {'app_slugs': []}, {'app_slugs': ['happ', 'happ']},
+                      {'app_slug': 'happ', 'app_slugs': ['happ']}]:
+        assert client.post('/api/orders', headers=headers,
+                           json={**selection, 'request_id': 'invalid-cart'}).status_code == 422
+    assert client.post('/api/orders', headers=headers,
+                       json={'app_slugs': ['unconfigured'], 'request_id': 'unknown-cart'}).status_code == 404
+    assert len(fake.keys) == 1
+    cfg.happ_ipa_path.unlink()
+    assert client.post('/api/orders', headers=headers,
+                       json={'app_slugs': ['happ'], 'request_id': 'unavailable-cart'}).status_code == 503
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0] == 1
+
+
+def test_cart_price_confirmation_prevents_new_checkout_and_preserves_retry_snapshot(configured):
+    cfg, fake, app, client = configured
+    headers = login(client)
+    payload = {'app_slugs': ['happ'], 'request_id': 'priced-cart', 'expected_amount_rub': '2.00'}
+    assert client.post('/api/orders', headers=headers, json=payload).status_code == 409
+    assert fake.keys == []
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0] == 0
+    fake.fail_create = True
+    payload['expected_amount_rub'] = '1.00'
+    assert client.post('/api/orders', headers=headers, json=payload).status_code == 503
+    cfg.happ_price_rub = '2.00'
+    fake.fail_create = False
+    recovered = client.post('/api/orders', headers=headers, json=payload)
+    assert recovered.status_code == 200 and recovered.json()['amount_rub'] == '1.00'
+    assert len(set(fake.keys)) == 1
+    payload['request_id'] = 'new-priced-cart'
+    assert client.post('/api/orders', headers=headers, json=payload).status_code == 409
+    payload['expected_amount_rub'] = '2.00'
+    result = client.post('/api/orders', headers=headers, json=payload).json()
+    assert result['amount_rub'] == result['items'][0]['amount_rub'] == '2.00'
+    assert len(set(fake.keys)) == 2
+
+
+def test_item_steps_are_owner_reported_paid_only_and_idempotent(configured):
+    cfg, fake, app, client = configured
+    owner = login(client)
+    outsider = login(client, 222)
+    result = order(client, owner)
+    base = f"/api/orders/{result['id']}/items/happ"
+    assert client.patch(base+'/state', headers=owner, json={'installed': True}).status_code == 403
+    assert client.patch(base+'/state', headers=outsider, json={'installed': True}).status_code == 404
+    payment_id = next(iter(fake.values))
+    fake.values[payment_id].update(status='succeeded', paid=True)
+    client.post('/api/payments/yookassa/webhook', json={'event': 'payment.succeeded', 'object': {'id': payment_id}})
+    assert client.post(base+'/install-link', headers=owner).status_code == 200
+    assert client.get(base+'/activation', headers=owner).json()['mode'] == 'manual'
+    assert not client.get(f"/api/orders/{result['id']}", headers=owner).json()['items'][0]['installed']
+    assert client.patch(base+'/state', headers=owner, json={'activated': True}).status_code == 409
+    installed = client.patch(base+'/state', headers=owner, json={'installed': True}).json()
+    assert installed['installed'] and not installed['activated']
+    assert client.patch(base+'/state', headers=owner, json={'installed': True}).json()['installed_at'] == installed['installed_at']
+    activated = client.patch(base+'/state', headers=owner, json={'activated': True}).json()
+    assert activated['installed'] and activated['activated'] and activated['activated_at']
+    assert client.patch(base+'/state', headers=owner, json={'activated': True}).json()['activated_at'] == activated['activated_at']
+    assert client.get('/api/orders', headers=owner).json()['items'][0]['items'][0]['activated']
+    reset = client.patch(base+'/state', headers=owner, json={'installed': False}).json()
+    assert not reset['installed'] and not reset['activated']
+    assert reset['installed_at'] is None and reset['activated_at'] is None
+    assert client.patch(base+'/state', headers=owner, json={'installed': True, 'activated': True}).json()['activated']
+    for body in [{}, {'installed': None}, {'installed': 1}, {'activated': 'true'},
+                 {'installed': False, 'activated': True}]:
+        assert client.patch(base+'/state', headers=owner, json=body).status_code == 422
+    assert client.patch(base+'/state', json={'installed': True}).status_code == 401
+    assert client.post(base+'/install-link', headers=outsider).status_code == 404
+    assert client.get(base+'/activation', headers=outsider).status_code == 404
+    assert client.patch(base.replace('happ', 'unknown')+'/state', headers=owner,
+                        json={'installed': True}).status_code == 404
+    cfg.yookassa_mode = 'live'
+    assert client.patch(base+'/state', headers=owner, json={'installed': True}).status_code == 403
+    cfg.yookassa_mode = 'test'
+    fake.values[payment_id]['refunded_amount'] = {'value': '1.00', 'currency': 'RUB'}
+    client.post('/api/payments/yookassa/webhook', json={'event': 'refund.succeeded', 'object': {'payment_id': payment_id}})
+    assert client.patch(base+'/state', headers=owner, json={'installed': True}).status_code == 403
+
+
+def test_multi_item_checkout_has_one_payment_and_independent_steps_and_files(configured, tmp_path):
+    cfg, _, original_app, _ = configured
+    second_path = tmp_path/'second.ipa'
+    with zipfile.ZipFile(second_path, 'w') as archive:
+        archive.writestr('Payload/Happ.app/Info.plist', plistlib.dumps({
+            'CFBundleIdentifier': 'test.fixture.second', 'CFBundleVersion': 'second-fixture',
+            'CFBundleShortVersionString': '1.0', 'MinimumOSVersion': '15.0'}))
+        archive.writestr('Payload/Happ.app/Happ', b'isolated-second-application-fixture')
+    second = IPAFile(second_path, hashlib.sha256(second_path.read_bytes()).hexdigest(),
+                     expected_bundle_id='test.fixture.second', title='Second test fixture')
+    isolated_cfg = cfg.model_copy(update={'database_path': tmp_path/'multi.sqlite3'})
+    fake = FakePayments()
+    catalog = {'happ': {'title': 'Happ', 'price_rub': '1.00', 'ipa': original_app.state.ipa},
+               'second': {'title': 'Second test fixture', 'price_rub': '2.50', 'ipa': second}}
+    with TestClient(create_app(isolated_cfg, payment_client=fake, catalog_items=catalog)) as client:
+        headers = login(client)
+        payload = {'app_slugs': ['second', 'happ'], 'request_id': 'multi-cart', 'expected_amount_rub': '3.50'}
+        response = client.post('/api/orders', headers=headers, json=payload)
+        assert response.status_code == 200
+        result = response.json()
+        assert result['amount_rub'] == '3.50'
+        assert [item['amount_rub'] for item in result['items']] == ['1.00', '2.50']
+        assert len(fake.keys) == 1
+        payload['app_slugs'].reverse()
+        assert client.post('/api/orders', headers=headers, json=payload).json()['id'] == result['id']
+        assert len(fake.keys) == 1
+        payload['app_slugs'] = ['happ']
+        assert client.post('/api/orders', headers=headers, json=payload).status_code == 409
+        payment_id = next(iter(fake.values))
+        fake.values[payment_id].update(status='succeeded', paid=True)
+        client.post('/api/payments/yookassa/webhook', json={'event': 'payment.succeeded', 'object': {'id': payment_id}})
+        base = f"/api/orders/{result['id']}"
+        assert client.post(base+'/install-link', headers=headers).status_code == 409
+        assert client.get(base+'/activation', headers=headers).status_code == 409
+        paths = {}
+        for slug, expected in [('happ', cfg.happ_ipa_path.read_bytes()), ('second', second_path.read_bytes())]:
+            grant = client.post(base+f'/items/{slug}/install-link', headers=headers)
+            assert grant.status_code == 200
+            paths[slug] = urlsplit(grant.json()['url']).path
+            assert client.get(paths[slug]+'/app.ipa').content == expected
+            metadata = plistlib.loads(client.get(paths[slug]+'/manifest.plist').content)['items'][0]['metadata']
+            assert metadata['bundle-identifier'] == ('su.ffg.happ' if slug == 'happ' else 'test.fixture.second')
+            assert metadata['title'] == catalog[slug]['title']
+        assert client.get(base+'/items/second/activation', headers=headers).status_code == 200
+        client.patch(base+'/items/second/state', headers=headers, json={'installed': True, 'activated': True})
+        items = client.get(base, headers=headers).json()['items']
+        assert not items[0]['installed'] and not items[0]['activated']
+        assert items[1]['installed'] and items[1]['activated']
+        fake.values[payment_id]['refunded_amount'] = {'value': '3.50', 'currency': 'RUB'}
+        client.post('/api/payments/yookassa/webhook', json={'event': 'refund.succeeded', 'object': {'payment_id': payment_id}})
+        assert all(client.get(path).status_code == 410 for path in paths.values())
+        assert client.patch(base+'/items/second/state', headers=headers, json={'installed': True}).status_code == 403
+
+
+def test_legacy_database_migration_preserves_orders_sessions_and_install_links(configured, tmp_path):
+    cfg, _, _, _ = configured
+    legacy_path = tmp_path/'legacy.sqlite3'
+    token, grant_token, order_id = 'a'*64, 'b'*64, str(uuid.uuid4())
+    now = int(time.time())
+    with sqlite3.connect(legacy_path) as conn:
+        conn.executescript('''
+            CREATE TABLE users (id INTEGER PRIMARY KEY, first_name TEXT NOT NULL, username TEXT, updated_at INTEGER NOT NULL);
+            CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), expires_at INTEGER NOT NULL);
+            CREATE TABLE orders (id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), app_slug TEXT NOT NULL,
+                app_title TEXT NOT NULL, amount_rub TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'RUB',
+                status TEXT NOT NULL DEFAULT 'pending', request_id TEXT NOT NULL, payment_id TEXT UNIQUE, payment_url TEXT,
+                created_at INTEGER NOT NULL, paid_at INTEGER, checked_at INTEGER NOT NULL DEFAULT 0,
+                test INTEGER NOT NULL, UNIQUE(user_id,request_id));
+            CREATE TABLE install_grants (token_hash TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id),
+                expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+        ''')
+        conn.execute('INSERT INTO users VALUES (111,?,?,?)', ('Legacy owner', 'legacy', now))
+        conn.execute('INSERT INTO sessions VALUES (?,?,?)', (token_hash(token), 111, now+3600))
+        conn.execute('''INSERT INTO orders (id,user_id,app_slug,app_title,amount_rub,status,request_id,created_at,paid_at,test)
+            VALUES (?,111,'happ','Happ','9.00','succeeded','legacy-request',?,?,1)''', (order_id, now-30, now-20))
+        conn.execute('INSERT INTO install_grants VALUES (?,?,?,0)', (token_hash(grant_token), order_id, now+1800))
+        before = conn.execute('SELECT * FROM orders').fetchone()
+    isolated_cfg = cfg.model_copy(update={'database_path': legacy_path})
+    headers = {'Authorization': 'Bearer '+token}
+    for _ in range(2):
+        with TestClient(create_app(isolated_cfg, payment_client=FakePayments())) as client:
+            result = client.get(f'/api/orders/{order_id}', headers=headers).json()
+            assert result['amount_rub'] == result['items'][0]['amount_rub'] == '9.00'
+            assert not result['items'][0]['installed'] and not result['items'][0]['activated']
+            assert client.get(f'/install/{grant_token}/app.ipa').content == cfg.happ_ipa_path.read_bytes()
+        with Database(legacy_path).connection() as conn:
+            assert tuple(conn.execute('SELECT * FROM orders').fetchone()) == before
+            assert conn.execute('SELECT COUNT(*) FROM order_items').fetchone()[0] == 1
+            assert conn.execute('SELECT app_slug FROM install_grants').fetchone()[0] == 'happ'
+
+
+def test_spa_payment_and_item_routes_serve_only_public_shell(configured):
+    cfg, fake, app, client = configured
+    cfg.static_dir.mkdir()
+    shell = '<!doctype html><html><body>public application shell</body></html>'
+    (cfg.static_dir/'index.html').write_text(shell)
+    order_id = str(uuid.uuid4())
+    for path in ['/', '/orders', '/help', '/apps/happ', '/payment/return', f'/orders/{order_id}',
+                 f'/payment/{order_id}', f'/orders/{order_id}/apps/happ',
+                 f'/orders/{order_id}/apps/historical-app']:
+        response = client.get(path)
+        assert response.status_code == 200 and response.text == shell
+    for path in ['/apps/unconfigured', '/payment/not-a-uuid', f'/payment/{order_id}/extra',
+                 '/orders/not-a-uuid/apps/happ', f'/orders/{order_id}/apps/happ/extra',
+                 f'/orders/{order_id}/apps/invalid_slug', '/.env', '/api/unmatched', '/install/unmatched']:
+        assert client.get(path).status_code == 404
+    assert fake.keys == [] and fake.gets == []
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0] == 0
+
+
+def test_ipa_metadata_uses_pinned_bundle_and_safely_escaped_title(tmp_path):
+    path = tmp_path/'other.ipa'
+    bundle_id = 'test.fixture.other'
+    title = '<script>alert("title")</script> & Another app'
+    with zipfile.ZipFile(path, 'w') as archive:
+        archive.writestr('Payload/Other.app/Info.plist', plistlib.dumps({
+            'CFBundleIdentifier': bundle_id, 'CFBundleVersion': '42', 'CFBundleShortVersionString': '2.0'}))
+        archive.writestr('Payload/Other.app/Other', b'isolated-ota-fixture')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert not IPAFile(path, digest).available
+    app_file = IPAFile(path, digest, expected_bundle_id=bundle_id, title=title)
+    assert app_file.available
+    manifest = app_file.manifest('https://example.test', 'a'*64)
+    metadata = plistlib.loads(manifest)['items'][0]['metadata']
+    assert metadata['bundle-identifier'] == bundle_id and metadata['title'] == title
+    assert b'<script>' not in manifest
+    page = app_file.page('https://example.test', 'a'*64)
+    assert title not in page and '<script>' not in page
+    assert f'<h1>{html.escape(title)}</h1>' in page
+    assert f'<title>Установить {html.escape(title)}</title>' in page
+    assert f'>Установить {html.escape(title)}</a>' in page

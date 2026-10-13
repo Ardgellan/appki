@@ -212,17 +212,21 @@ class YooKassaClient:
             or not _https_url(return_url)
         ):
             raise PaymentValidationError("Не удалось подготовить платёж. Проверьте параметры заказа.")
+        payload = {
+            "amount": {"value": amount_rub, "currency": "RUB"},
+            "capture": True,
+            "confirmation": {"type": "redirect", "return_url": return_url},
+            "description": description,
+            "metadata": {"order_id": order_id},
+        }
+        # SBP is available only in real shops; test shops keep their test checkout.
+        if self.mode == "live":
+            payload["payment_method_data"] = {"type": "sbp"}
         payment = await self._request(
             "POST",
             "/payments",
             headers={"Idempotence-Key": idempotence_key},
-            json={
-                "amount": {"value": amount_rub, "currency": "RUB"},
-                "capture": True,
-                "confirmation": {"type": "redirect", "return_url": return_url},
-                "description": description,
-                "metadata": {"order_id": order_id},
-            },
+            json=payload,
         )
         status = validate_payment(
             payment,

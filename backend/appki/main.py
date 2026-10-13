@@ -8,12 +8,13 @@ import secrets
 import time
 import uuid
 from urllib.parse import quote, urlsplit
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, StrictBool, ValidationError, model_validator
 
 from .auth import InvalidTelegramData, token_hash, validate_init_data
 from .config import Settings
@@ -31,18 +32,56 @@ class AuthBody(BaseModel):
     init_data: str = Field(min_length=1, max_length=16384)
 
 
+AppSlug = Annotated[str, Field(pattern=r'^[a-z0-9-]{1,64}$')]
+
+
 class OrderBody(BaseModel):
-    app_slug: str = Field(pattern=r'^[a-z0-9-]{1,64}$')
+    app_slug: AppSlug | None = None
+    app_slugs: list[AppSlug] | None = Field(default=None, min_length=1, max_length=20)
     request_id: str = Field(pattern=r'^[A-Za-z0-9_-]{8,64}$')
+    expected_amount_rub: str | None = Field(default=None, pattern=r'^[0-9]{1,8}\.[0-9]{2}$')
+
+    @model_validator(mode='after')
+    def valid_selection(self):
+        if (self.app_slug is None) == (self.app_slugs is None):
+            raise ValueError('Specify app_slug or app_slugs')
+        if self.app_slugs is not None and len(set(self.app_slugs)) != len(self.app_slugs):
+            raise ValueError('Duplicate applications')
+        return self
+
+    @property
+    def slugs(self):
+        return sorted(self.app_slugs if self.app_slugs is not None else [self.app_slug])
 
 
-def create_app(settings: Settings | None = None, *, payment_client=None):
+class ItemStateBody(BaseModel):
+    installed: StrictBool | None = None
+    activated: StrictBool | None = None
+
+    @model_validator(mode='after')
+    def valid_update(self):
+        if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError('Specify installation or activation state')
+        if self.installed is False and self.activated is True:
+            raise ValueError('Activation requires installation')
+        return self
+
+
+def create_app(settings: Settings | None = None, *, payment_client=None, catalog_items=None):
     try:
         cfg = settings or Settings()
     except ValidationError:
         raise RuntimeError('Invalid Appki configuration; check environment settings.') from None
     db = Database(cfg.database_path)
     ipa = IPAFile(cfg.happ_ipa_path, cfg.happ_ipa_sha256)
+    # The live catalog contains only configured products. Tests can inject isolated fixtures.
+    products = catalog_items if catalog_items is not None else {
+        'happ': {'title': 'Happ', 'subtitle': 'Ваши VPN-подписки в одном приложении',
+                 'description': 'Клиент для подключения через Xray. Установка оригинального приложения на iPhone с пошаговой помощью в активации. VPN-подписка приобретается отдельно.',
+                 'price_rub': cfg.happ_price_rub, 'category': 'VPN',
+                 'features': ['Оригинальная сборка', 'Установка через Safari', 'Инструкция по активации'],
+                 'ipa': ipa}
+    }
     payment = payment_client
     if payment is None and cfg.payments_configured:
         try:
@@ -68,8 +107,10 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
     async def lifespan(app):
         db.initialize()
         with db.connection(write=True) as conn:
-            conn.execute('INSERT OR REPLACE INTO apps VALUES (?,?,?,?,?)',
-                         ('happ', 'Happ', ipa.version, ipa.size, int(ipa.available)))
+            for slug, product in products.items():
+                app_file = product['ipa']
+                conn.execute('INSERT OR REPLACE INTO apps VALUES (?,?,?,?,?)',
+                             (slug, product['title'], app_file.version, app_file.size, int(app_file.available)))
             conn.execute('DELETE FROM sessions WHERE expires_at <= ?', (int(time.time()),))
             conn.execute('DELETE FROM install_grants WHERE expires_at <= ?', (int(time.time()),))
         yield
@@ -129,14 +170,33 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
             raise HTTPException(401, 'Сессия истекла. Откройте сервис через Telegram снова.')
         return dict(row)
 
-    def catalog():
-        available = ipa.refresh()
-        return {'slug': 'happ', 'title': 'Happ', 'subtitle': 'Ваши VPN-подписки в одном приложении',
-                'description': 'Клиент для подключения через Xray. Установка оригинального приложения на iPhone с пошаговой помощью в активации. VPN-подписка приобретается отдельно.',
-                'version': ipa.version, 'size_bytes': ipa.size, 'minimum_ios': ipa.minimum_ios,
-                'price_rub': cfg.happ_price_rub, 'category': 'VPN',
-                'features': ['Оригинальная сборка', 'Установка через Safari', 'Инструкция по активации'],
-                'available': available}
+    def catalog(slug):
+        product = products.get(slug)
+        if product is None:
+            raise HTTPException(404, 'Приложение не найдено.')
+        app_file = product['ipa']
+        available = app_file.refresh()
+        public = {key: value for key, value in product.items() if key != 'ipa'}
+        if catalog_items is None:
+            public['price_rub'] = cfg.happ_price_rub
+        return {**public,
+                'slug': slug, 'version': app_file.version, 'size_bytes': app_file.size,
+                'minimum_ios': app_file.minimum_ios, 'available': available}
+
+    def order_items(order_id):
+        with db.connection() as conn:
+            return [dict(row) for row in conn.execute(
+                'SELECT * FROM order_items WHERE order_id=? ORDER BY app_slug', (order_id,)).fetchall()]
+
+    def item_view(item, order):
+        product = products.get(item['app_slug'])
+        return {'app_slug': item['app_slug'], 'app_title': item['app_title'],
+                'amount_rub': item['amount_rub'], 'installed': item['installed_at'] is not None,
+                'activated': item['activated_at'] is not None,
+                'installed_at': iso(item['installed_at']), 'activated_at': iso(item['activated_at']),
+                'can_install': (order['status'] == 'succeeded' and
+                                bool(order['test']) == (cfg.yookassa_mode == 'test') and
+                                product is not None and product['ipa'].available)}
 
     def owned_order(order_id, user_id):
         with db.connection() as conn:
@@ -146,11 +206,13 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
         return dict(row)
 
     def order_view(row):
+        items = [item_view(item, row) for item in order_items(row['id'])]
         return {'id': row['id'], 'app_slug': row['app_slug'], 'app_title': row['app_title'],
-                'amount_rub': row['amount_rub'], 'currency': row['currency'], 'status': row['status'],
+                'amount_rub': row['amount_rub'], 'total_rub': row['amount_rub'], 'items': items,
+                'currency': row['currency'], 'status': row['status'],
                 'payment_url': row['payment_url'], 'created_at': iso(row['created_at']),
                 'paid_at': iso(row['paid_at']), 'test': bool(row['test']),
-                'can_install': row['status'] == 'succeeded' and ipa.available and bool(row['test']) == (cfg.yookassa_mode == 'test')}
+                'can_install': any(item['can_install'] for item in items)}
 
     def record_payment(order, value):
         status = validate_payment(value, order_id=order['id'], payment_id=order['payment_id'],
@@ -203,6 +265,18 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
             raise HTTPException(403, 'Доступ появится после подтверждённой оплаты в текущем режиме магазина.')
         return row
 
+    def paid_item(order_id, user_id, app_slug=None):
+        row = paid_order(order_id, user_id)
+        items = order_items(order_id)
+        if app_slug is None:
+            if len(items) != 1:
+                raise HTTPException(409, 'Выберите приложение в заказе.')
+            return row, items[0]
+        item = next((item for item in items if item['app_slug'] == app_slug), None)
+        if item is None:
+            raise HTTPException(404, 'Приложение в заказе не найдено.')
+        return row, item
+
     @app.get('/healthz')
     def health():
         with db.connection() as conn:
@@ -217,13 +291,11 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
 
     @app.get('/api/apps')
     def apps():
-        return {'items': [catalog()]}
+        return {'items': [catalog(slug) for slug in products]}
 
     @app.get('/api/apps/{slug}')
     def one_app(slug: str):
-        if slug != 'happ':
-            raise HTTPException(404, 'Приложение не найдено.')
-        return catalog()
+        return catalog(slug)
 
     @app.post('/api/auth/telegram')
     def authenticate(body: AuthBody, request: Request):
@@ -253,32 +325,43 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
     async def create_order(body: OrderBody, user=Depends(current_user)):
         if payment is None:
             raise HTTPException(503, 'Приём оплаты ещё не настроен.')
-        if body.app_slug != 'happ':
-            raise HTTPException(404, 'Приложение не найдено.')
-        if not ipa.refresh():
+        selected = [catalog(slug) for slug in body.slugs]
+        if not all(item['available'] for item in selected):
             raise HTTPException(503, 'Файл приложения временно недоступен. Оплата не создана.')
+        total = format(sum((Decimal(item['price_rub']) for item in selected), Decimal('0')), '.2f')
         rate_limit(('orders', user['id']), 12)
         now = int(time.time())
         with db.connection(write=True) as conn:
             row = conn.execute('SELECT * FROM orders WHERE user_id=? AND request_id=?',
                                (user['id'], body.request_id)).fetchone()
             if row is None:
+                if body.expected_amount_rub is not None and Decimal(body.expected_amount_rub) != Decimal(total):
+                    raise HTTPException(409, 'Цена изменилась. Обновите корзину и подтвердите новую сумму.')
                 order_id = str(uuid.uuid4())
                 conn.execute('''INSERT INTO orders
                     (id,user_id,app_slug,app_title,amount_rub,request_id,created_at,test)
                     VALUES (?,?,?,?,?,?,?,?)''',
-                    (order_id, user['id'], body.app_slug, 'Happ', cfg.happ_price_rub,
+                    (order_id, user['id'], selected[0]['slug'], ', '.join(item['title'] for item in selected), total,
                      body.request_id, now, int(cfg.yookassa_mode == 'test')))
+                conn.executemany('''INSERT INTO order_items (order_id,app_slug,app_title,amount_rub)
+                    VALUES (?,?,?,?)''',
+                    [(order_id, item['slug'], item['title'], item['price_rub']) for item in selected])
                 row = conn.execute('SELECT * FROM orders WHERE id=?', (order_id,)).fetchone()
+            else:
+                saved_slugs = [item['app_slug'] for item in conn.execute(
+                    'SELECT app_slug FROM order_items WHERE order_id=? ORDER BY app_slug', (row['id'],)).fetchall()]
+                if saved_slugs != body.slugs:
+                    raise HTTPException(409, 'Этот идентификатор уже используется для другого заказа.')
+                if (body.expected_amount_rub is not None and
+                        Decimal(body.expected_amount_rub) != Decimal(row['amount_rub'])):
+                    raise HTTPException(409, 'Сумма этой попытки оплаты отличается. Откройте сохранённый заказ.')
             order = dict(row)
-        if order['app_slug'] != body.app_slug:
-            raise HTTPException(409, 'Этот идентификатор уже используется для другого заказа.')
         return await ensure_payment(order)
 
     async def ensure_payment(order):
         if payment is None:
             raise HTTPException(503, 'Приём оплаты ещё не настроен.')
-        if not ipa.refresh():
+        if not all(catalog(item['app_slug'])['available'] for item in order_items(order['id'])):
             raise HTTPException(503, 'Файл приложения временно недоступен. Оплата не создана.')
         if bool(order['test']) != (cfg.yookassa_mode == 'test'):
             raise HTTPException(409, 'Режим оплаты изменился. Создайте новый заказ.')
@@ -289,7 +372,7 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
             raise HTTPException(409, 'Статус старой попытки оплаты нужно уточнить в поддержке. Не оплачивайте повторно.')
         try:
             value = await payment.create_payment(order_id=order['id'], amount_rub=order['amount_rub'],
-                        description=f"{cfg.appki_brand}: доступ к установке Happ", idempotence_key=order['id'],
+                        description=f"{cfg.appki_brand}: доступ к установке {order['app_title']}"[:128], idempotence_key=order['id'],
                         return_url=f"{cfg.public_base_url}/payment/return?order_id={quote(order['id'])}")
             return order_view(record_payment(order, value))
         except (PaymentProviderError, PaymentConfigurationError):
@@ -322,30 +405,78 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
             raise HTTPException(502, 'Не удалось проверить оплату. Обратитесь в поддержку.')
         return order_view(row)
 
-    @app.post('/api/orders/{order_id}/install-link')
-    def install_link(order_id: str, user=Depends(current_user)):
-        paid_order(order_id, user['id'])
-        if not ipa.refresh():
+    def issue_install_link(order_id, user_id, app_slug=None):
+        _, item = paid_item(order_id, user_id, app_slug)
+        product = products.get(item['app_slug'])
+        if product is None or not product['ipa'].refresh():
             raise HTTPException(503, 'Файл приложения временно недоступен.')
-        rate_limit(('grants', user['id']), 20)
+        rate_limit(('grants', user_id), 20)
         token = secrets.token_hex(32)
         expires = int(time.time()) + cfg.install_ttl_seconds
         with db.connection(write=True) as conn:
             # Check payment again inside the same transaction as capability creation.
-            row = conn.execute('SELECT status,test FROM orders WHERE id=? AND user_id=?', (order_id, user['id'])).fetchone()
+            row = conn.execute('SELECT status,test FROM orders WHERE id=? AND user_id=?', (order_id, user_id)).fetchone()
             if row is None or row['status'] != 'succeeded' or bool(row['test']) != (cfg.yookassa_mode == 'test'):
                 raise HTTPException(403, 'Доступ к заказу закрыт.')
-            conn.execute('INSERT INTO install_grants VALUES (?,?,?,0)', (token_hash(token), order_id, expires))
+            conn.execute('''INSERT INTO install_grants (token_hash,order_id,expires_at,revoked,app_slug)
+                VALUES (?,?,?,0,?)''', (token_hash(token), order_id, expires, item['app_slug']))
             conn.execute('DELETE FROM install_grants WHERE expires_at<=?', (int(time.time()),))
         return {'url': f'{cfg.public_base_url}/install/{token}', 'expires_at': iso(expires)}
 
-    @app.get('/api/orders/{order_id}/activation')
-    def activation(order_id: str, user=Depends(current_user)):
-        paid_order(order_id, user['id'])
+    @app.post('/api/orders/{order_id}/install-link')
+    def install_link(order_id: str, user=Depends(current_user)):
+        return issue_install_link(order_id, user['id'])
+
+    @app.post('/api/orders/{order_id}/items/{app_slug}/install-link')
+    def item_install_link(order_id: str, app_slug: str, user=Depends(current_user)):
+        return issue_install_link(order_id, user['id'], app_slug)
+
+    def activation_for_item(order_id, user_id, app_slug=None):
+        paid_item(order_id, user_id, app_slug)
         result = {'mode': cfg.activation_mode, 'instructions': cfg.activation_instructions, 'support_url': cfg.support_url}
         if cfg.activation_mode == 'credentials':
             result.update(apple_id=cfg.activation_apple_id, password=cfg.activation_password)
         return result
+
+    @app.get('/api/orders/{order_id}/activation')
+    def activation(order_id: str, user=Depends(current_user)):
+        return activation_for_item(order_id, user['id'])
+
+    @app.get('/api/orders/{order_id}/items/{app_slug}/activation')
+    def item_activation(order_id: str, app_slug: str, user=Depends(current_user)):
+        return activation_for_item(order_id, user['id'], app_slug)
+
+    @app.patch('/api/orders/{order_id}/items/{app_slug}/state')
+    def item_state(order_id: str, app_slug: str, body: ItemStateBody, user=Depends(current_user)):
+        paid_item(order_id, user['id'], app_slug)
+        now = int(time.time())
+        with db.connection(write=True) as conn:
+            row = conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?', (order_id, user['id'])).fetchone()
+            if row is None:
+                raise HTTPException(404, 'Заказ не найден.')
+            if row['status'] != 'succeeded' or bool(row['test']) != (cfg.yookassa_mode == 'test'):
+                raise HTTPException(403, 'Доступ к заказу закрыт.')
+            item = conn.execute('SELECT * FROM order_items WHERE order_id=? AND app_slug=?',
+                                (order_id, app_slug)).fetchone()
+            if item is None:
+                raise HTTPException(404, 'Приложение в заказе не найдено.')
+            installed_at, activated_at = item['installed_at'], item['activated_at']
+            if body.installed is True:
+                installed_at = installed_at if installed_at is not None else now
+            elif body.installed is False:
+                installed_at, activated_at = None, None
+            if body.activated is True:
+                if installed_at is None:
+                    raise HTTPException(409, 'Сначала отметьте установку приложения.')
+                activated_at = activated_at if activated_at is not None else now
+            elif body.activated is False:
+                activated_at = None
+            # These are the owner's reported UI steps, not confirmation from Apple.
+            conn.execute('UPDATE order_items SET installed_at=?,activated_at=? WHERE order_id=? AND app_slug=?',
+                         (installed_at, activated_at, order_id, app_slug))
+            updated = dict(item)
+            updated.update(installed_at=installed_at, activated_at=activated_at)
+        return item_view(updated, row)
 
     @app.post('/api/payments/yookassa/webhook')
     async def webhook(request: Request):
@@ -386,34 +517,38 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
         if request.url.query or not re.fullmatch('[0-9a-f]{64}', token):
             raise HTTPException(404, 'Ссылка не найдена.')
         with db.connection() as conn:
-            row = conn.execute('''SELECT g.expires_at,g.revoked,o.status,o.test FROM install_grants g
-                JOIN orders o ON o.id=g.order_id WHERE g.token_hash=?''', (token_hash(token),)).fetchone()
+            row = conn.execute('''SELECT g.expires_at,g.revoked,g.app_slug,o.status,o.test FROM install_grants g
+                JOIN orders o ON o.id=g.order_id
+                JOIN order_items i ON i.order_id=g.order_id AND i.app_slug=g.app_slug
+                WHERE g.token_hash=?''', (token_hash(token),)).fetchone()
         if row is None:
             raise HTTPException(404, 'Ссылка не найдена.')
         if (row['expires_at'] <= int(time.time()) or row['revoked'] or row['status'] != 'succeeded'
                 or bool(row['test']) != (cfg.yookassa_mode == 'test')):
             raise HTTPException(410, 'Ссылка истекла. Получите новую в своём заказе.')
-        if not ipa.refresh():
+        product = products.get(row['app_slug'])
+        if product is None or not product['ipa'].refresh():
             raise HTTPException(503, 'Файл приложения временно недоступен.')
+        return product['ipa']
 
     @app.api_route('/install/{token}', methods=['GET', 'HEAD'])
     def install_page(token: str, request: Request):
-        check_grant(token, request)
-        content = ipa.page(cfg.public_base_url, token).encode()
+        app_file = check_grant(token, request)
+        content = app_file.page(cfg.public_base_url, token).encode()
         return Response(content if request.method != 'HEAD' else b'', media_type='text/html',
                         headers={**PRIVATE_HEADERS, 'Content-Length': str(len(content))})
 
     @app.api_route('/install/{token}/manifest.plist', methods=['GET', 'HEAD'])
     def manifest(token: str, request: Request):
-        check_grant(token, request)
-        content = ipa.manifest(cfg.public_base_url, token)
+        app_file = check_grant(token, request)
+        content = app_file.manifest(cfg.public_base_url, token)
         return Response(content if request.method != 'HEAD' else b'', media_type='application/xml',
                         headers={**PRIVATE_HEADERS, 'Content-Length': str(len(content))})
 
     @app.api_route('/install/{token}/app.ipa', methods=['GET', 'HEAD'])
     def app_file(token: str, request: Request):
-        check_grant(token, request)
-        return ipa.response(request)
+        file = check_grant(token, request)
+        return file.response(request)
 
     if (cfg.static_dir / 'assets').is_dir():
         app.mount('/assets', StaticFiles(directory=cfg.static_dir / 'assets'), name='assets')
@@ -423,7 +558,12 @@ def create_app(settings: Settings | None = None, *, payment_client=None):
         if path.startswith(('api/', 'install/', 'assets/')) or path in ('api', 'install', 'assets'):
             raise HTTPException(404, 'Страница не найдена.')
         # Explicit SPA allowlist prevents accidentally exposing config/IPA files or future routes.
-        if path not in ('', 'apps/happ', 'orders', 'help', 'payment/return') and not re.fullmatch(r'orders/[0-9a-f-]{36}', path):
+        order_uuid = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+        catalog_page = path.startswith('apps/') and path[5:] in products
+        item_page = re.fullmatch(rf'orders/{order_uuid}/apps/[a-z0-9-]{{1,64}}', path)
+        payment_page = re.fullmatch(rf'payment/{order_uuid}', path)
+        if (path not in ('', 'orders', 'help', 'payment/return') and not catalog_page
+                and not re.fullmatch(r'orders/[0-9a-f-]{36}', path) and not item_page and not payment_page):
             raise HTTPException(404, 'Страница не найдена.')
         index = cfg.static_dir / 'index.html'
         if not index.is_file():

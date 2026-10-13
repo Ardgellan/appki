@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactNode } from "react";
 export function Icon({
   name,
   size = 20,
@@ -8,7 +8,7 @@ export function Icon({
   size?: number;
   className?: string;
 }) {
-  const paths: Record<string, React.ReactNode> = {
+  const paths: Record<string, ReactNode> = {
     grid: (
       <>
         <rect x="3" y="3" width="7" height="7" rx="2" />
@@ -35,7 +35,18 @@ export function Icon({
       </>
     ),
     back: <path d="m14 6-6 6 6 6" />,
+    chevronRight: <path d="m9 6 6 6-6 6" />,
     down: <path d="m6 9 6 6 6-6" />,
+    basket: (
+      <>
+        <path d="m7 10 5-7 5 7M3 10h18l-2 10H5L3 10ZM9 14v3m6-3v3" />
+      </>
+    ),
+    bank: (
+      <>
+        <path d="m3 9 9-6 9 6H3ZM4 21h16M6 10v7m6-7v7m6-7v7M4 18h16" />
+      </>
+    ),
     check: <path d="m5 12 4 4L19 6" />,
     lock: (
       <>
@@ -118,24 +129,105 @@ export function Icon({
     </svg>
   );
 }
-export function AppIcon({ large = false }: { large?: boolean }) {
-  return (
-    <div className={`app-icon ${large ? "large" : ""}`} aria-hidden="true">
+export function AppIcon({
+  slug = "happ",
+  title,
+  large = false,
+}: {
+  slug?: string;
+  title?: string;
+  large?: boolean;
+}) {
+  const normalized = slug.toLowerCase().replace(/[-_]/g, "");
+  const variants: Record<string, string> = {
+    happ: "happ",
+    v2ray: "v2ray",
+    v2raytun: "v2ray",
+    sber: "sber",
+    sberbank: "sber",
+    tbank: "tbank",
+    tinkoff: "tbank",
+    vtb: "vtb",
+    vtbbank: "vtb",
+    chatgpt: "chatgpt",
+    deepseek: "deepseek",
+  };
+  const variant = variants[normalized] ?? "generic";
+  const marks: Record<string, ReactNode> = {
+    happ: (
       <svg viewBox="0 0 64 64" fill="none">
         <path
           d="M19 14v36M45 14v36M19 32h26"
           stroke="currentColor"
-          strokeWidth="10"
-          strokeLinecap="round"
-        />
-        <path
-          d="m41 10 8 8"
-          stroke="white"
-          strokeOpacity=".3"
-          strokeWidth="2"
+          strokeWidth="9"
           strokeLinecap="round"
         />
       </svg>
+    ),
+    v2ray: <span>V2</span>,
+    sber: (
+      <svg viewBox="0 0 64 64" fill="none">
+        <path
+          d="M52 27a22 22 0 1 1-10-15"
+          stroke="currentColor"
+          strokeWidth="5"
+          strokeLinecap="round"
+        />
+        <path
+          d="m20 29 10 10 25-24"
+          stroke="currentColor"
+          strokeWidth="5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    ),
+    tbank: <span>Т</span>,
+    vtb: (
+      <svg viewBox="0 0 64 64" fill="currentColor">
+        <path d="M14 15h41l-5 9H9l5-9ZM10 29h34l-5 9H5l5-9ZM6 43h27l-5 9H1l5-9Z" />
+      </svg>
+    ),
+    chatgpt: (
+      <svg viewBox="0 0 64 64" fill="none">
+        <g
+          stroke="currentColor"
+          strokeWidth="3.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          {[0, 60, 120, 180, 240, 300].map((angle) => (
+            <path
+              key={angle}
+              d="M32 13c5-3 11-1 14 4l5 9c2 5 0 10-5 13l-14 8V25l13-7"
+              transform={`rotate(${angle} 32 32)`}
+            />
+          ))}
+        </g>
+      </svg>
+    ),
+    deepseek: (
+      <svg viewBox="0 0 64 64" fill="currentColor">
+        <path d="M8 31c1-10 10-17 22-16 8 0 15 4 19 10 5-2 7-6 9-10 3 7 2 14-4 20-2 10-10 16-23 16-13 0-23-8-23-20Z" />
+        <path d="M22 45c-1 8 4 12 11 13l-3-11-8-2Z" />
+        <path
+          d="M13 28c5 5 10 7 17 7"
+          fill="none"
+          stroke="#fff"
+          strokeWidth="3"
+          strokeLinecap="round"
+        />
+        <circle cx="35" cy="24" r="2.5" fill="#fff" />
+      </svg>
+    ),
+    generic: <span>{(title || slug).slice(0, 2).toUpperCase()}</span>,
+  };
+  return (
+    <div
+      className={`app-icon app-icon--${variant}${large ? " large" : ""}`}
+      aria-hidden="true"
+    >
+      {marks[variant]}
     </div>
   );
 }

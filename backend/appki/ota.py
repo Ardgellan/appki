@@ -41,15 +41,17 @@ def byte_range(value: str, size: int):
 
 
 class IPAFile:
-    def __init__(self, path: Path, expected_sha: str):
+    def __init__(self, path: Path, expected_sha: str, *, expected_bundle_id: str = 'su.ffg.happ', title: str = 'Happ'):
         self.path = Path(path)
         self.expected_sha = expected_sha
+        self.expected_bundle_id = expected_bundle_id
+        self.title = title
         self.available = False
         self.size = 305092112
         self.version = '5.9.0'
         self.build = '2609171647'
         self.minimum_ios = '15.0'
-        self.bundle_id = 'su.ffg.happ'
+        self.bundle_id = expected_bundle_id
         self.fingerprint = None
         self.refresh()
 
@@ -84,7 +86,7 @@ class IPAFile:
                     if len(names) != 1 or archive.getinfo(names[0]).file_size > 1024 * 1024:
                         raise ValueError('Invalid app metadata')
                     info = plistlib.loads(archive.read(names[0]))
-                    if info.get('CFBundleIdentifier') != 'su.ffg.happ':
+                    if info.get('CFBundleIdentifier') != self.expected_bundle_id:
                         raise ValueError('Unexpected application')
                     self.bundle_id = info['CFBundleIdentifier']
                     self.version = str(info['CFBundleShortVersionString'])
@@ -100,19 +102,20 @@ class IPAFile:
         return plistlib.dumps({'items': [{
             'assets': [{'kind': 'software-package', 'url': f'{base}/install/{token}/app.ipa'}],
             'metadata': {'bundle-identifier': self.bundle_id, 'bundle-version': self.build,
-                         'kind': 'software', 'title': 'Happ'}
+                         'kind': 'software', 'title': self.title}
         }]}, fmt=plistlib.FMT_XML, sort_keys=False)
 
     def page(self, base: str, token: str):
         link = 'itms-services://?action=download-manifest&url=' + quote(f'{base}/install/{token}/manifest.plist', safe='')
+        title = html.escape(self.title)
         return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Установить Happ</title>
-<style>body{{font:17px/1.55 system-ui;background:#f7f6f2;color:#19271f;margin:0;padding:24px}}main{{max-width:460px;margin:6vh auto;background:white;padding:28px;border-radius:24px}}h1{{font-size:34px}}a{{display:block;background:#185b3f;color:white;text-align:center;text-decoration:none;padding:17px;border-radius:14px;font-weight:600}}small{{display:block;color:#647066;margin-top:24px}}.meta{{color:#647066}}</style></head>
-<body><main><p class="meta">Аппки · Установка на iPhone</p><h1>Happ</h1>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Установить {title}</title>
+<style>body{{font:17px/1.55 system-ui;background:#fff;color:#151515;margin:0;padding:24px}}main{{max-width:460px;margin:6vh auto;background:#f1f1f1;padding:28px;border-radius:24px}}h1{{font-size:34px}}a{{display:block;background:#0057ff;color:white;text-align:center;text-decoration:none;padding:17px;border-radius:14px;font-weight:600}}small{{display:block;color:#777;margin-top:24px}}.meta{{color:#777}}</style></head>
+<body><main><p class="meta">Аппки · Установка на iPhone</p><h1>{title}</h1>
 <p class="meta">{html.escape(self.version)} · {round(self.size/1000000)} МБ · iOS {html.escape(self.minimum_ios)}+</p>
 <p>Откройте эту страницу в Safari на iPhone и подтвердите установку.</p>
-<p>Если Happ уже установлен, сохраните настройки. iPhone может попросить удалить прежнюю копию.</p>
-<a href="{html.escape(link, quote=True)}">Установить Happ</a>
+<p>Если {title} уже установлен, сохраните настройки. iPhone может попросить удалить прежнюю копию.</p>
+<a href="{html.escape(link, quote=True)}">Установить {title}</a>
 <p>Дождитесь завершения загрузки на главном экране. Затем вернитесь в заказ в Telegram и откройте инструкцию активации.</p>
 <small>Ссылка временная и даёт доступ к файлу приложения. Не пересылайте её. Пароль Apple Account на этой странице не запрашивается.</small>
 </main></body></html>'''
