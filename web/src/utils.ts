@@ -26,6 +26,11 @@ export function telegramURL(username: string | undefined): string | null {
   const clean = username?.replace(/^@/, "") ?? "";
   return /^[a-zA-Z0-9_]{5,32}$/.test(clean) ? `https://t.me/${clean}` : null;
 }
+export function supportURL(value: string | undefined): string | null {
+  return (
+    httpsURL(value) ?? (value?.startsWith("@") ? telegramURL(value) : null)
+  );
+}
 export function orderStatus(status: string): string {
   return (
     {

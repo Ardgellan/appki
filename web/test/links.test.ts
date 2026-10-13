@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { httpsURL, telegramURL, routeForOrder } from "../src/utils.ts";
+import {
+  httpsURL,
+  telegramURL,
+  supportURL,
+  routeForOrder,
+} from "../src/utils.ts";
 test("external navigation refuses script, plaintext and userinfo URLs", () => {
   for (const value of [
     "javascript:alert(1)",
@@ -26,6 +31,18 @@ test("Telegram deep links cannot escape the configured bot name", () => {
     "",
   ])
     assert.equal(telegramURL(value), null);
+});
+test("support accepts a Telegram username without allowing unsafe links", () => {
+  assert.equal(supportURL("@aegiev"), "https://t.me/aegiev");
+  assert.equal(supportURL("https://t.me/aegiev"), "https://t.me/aegiev");
+  for (const value of [
+    "@aegiev?start=bad",
+    "javascript:alert(1)",
+    "https://user:pass@example.com",
+    "@x",
+    "http://example.com",
+  ])
+    assert.equal(supportURL(value), null);
 });
 test("order routes encode identifiers rather than treating them as navigation input", () => {
   assert.equal(

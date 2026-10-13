@@ -38,6 +38,7 @@ import {
   httpsURL,
   orderStatus,
   rubles,
+  supportURL,
   telegramURL,
 } from "./utils";
 
@@ -895,7 +896,7 @@ function ActivationPanel({
   useEffect(() => {
     void load();
   }, [load]);
-  const support = httpsURL(data?.support_url || config?.support_url);
+  const support = supportURL(data?.support_url || config?.support_url);
   async function complete() {
     setBusy(true);
     setError("");
@@ -1463,7 +1464,7 @@ const questions = [
 ];
 function Help() {
   const { config } = useApp();
-  const support = httpsURL(config?.support_url);
+  const support = supportURL(config?.support_url);
   return (
     <section>
       <div className="page-heading">
