@@ -8,8 +8,14 @@ test -s "$upload/release.tgz"
 test -f "$upload/appki.env"
 test -s /etc/letsencrypt/live/happ-ota-ip/fullchain.pem
 id -u appki >/dev/null 2>&1 || useradd --system --home /var/lib/appki --shell /usr/sbin/nologin appki
+getent group appki-artifacts >/dev/null || groupadd --system appki-artifacts
+id -u appki-acquirer >/dev/null 2>&1 || useradd --system --user-group --home /var/lib/appki-acquirer --shell /usr/sbin/nologin appki-acquirer
+usermod -a -G appki-artifacts appki
+usermod -a -G appki-artifacts appki-acquirer
 install -d -o root -g root -m 755 /opt/appki /opt/appki/releases
-install -d -o appki -g appki -m 700 /var/lib/appki
+install -d -o appki -g appki-artifacts -m 710 /var/lib/appki
+install -d -o appki-acquirer -g appki-acquirer -m 700 /var/lib/appki-acquirer
+install -d -o appki-acquirer -g appki-artifacts -m 2750 /var/lib/appki/artifacts
 install -d -o root -g appki -m 750 /var/lib/appki/apps /etc/appki /var/backups/appki
 install -d -o root -g root -m 755 "$target"
 tar -xzf "$upload/release.tgz" -C "$target" --no-same-owner
@@ -18,9 +24,27 @@ chmod -R go-w "$target"
 if [ ! -f /var/lib/appki/apps/Happ.ipa ]; then
     install -o root -g appki -m 440 /var/lib/happ-ota/Happ.ipa /var/lib/appki/apps/Happ.ipa
 fi
-printf '%s  %s\n' '94e9591fe92be4589c19344ab7089d0b6abe101cf9cfa7a80707d6c390a4a2f2' '/var/lib/appki/apps/Happ.ipa' | sha256sum -c -
 if [ ! -x /opt/appki/venv/bin/python ]; then python3 -m venv /opt/appki/venv; fi
 /opt/appki/venv/bin/python -m pip install --disable-pip-version-check -q -r "$target/backend/requirements.lock"
+APPKI_DEPLOY_BACKEND="$target/backend" APPKI_DEPLOY_ENV="$upload/appki.env" /opt/appki/venv/bin/python - <<'PY'
+import os
+import sys
+sys.path.insert(0, os.environ['APPKI_DEPLOY_BACKEND'])
+from appki.config import Settings
+from appki.catalog import ArtifactRegistry, load_products
+cfg = Settings(_env_file=os.environ['APPKI_DEPLOY_ENV'])
+registry = ArtifactRegistry(cfg.artifact_registry_path, cfg.artifact_root)
+products = load_products(cfg, registry)
+checked = 0
+for product in products.values():
+    if product.get('coming_soon', False):
+        continue
+    ipa = product.get('ipa')
+    if ipa is None or not ipa.refresh():
+        raise SystemExit('IPA verification failed; deployment has not switched releases.')
+    checked += 1
+print(f'Verified {checked} active IPA file(s).')
+PY
 # Stable import path follows the current release symlink; no editable build required.
 site_dir=$(/opt/appki/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')
 printf '%s\n' /opt/appki/current/backend > "$site_dir/appki.pth"

@@ -20,6 +20,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/appki
+ReadOnlyPaths=/var/lib/appki/artifacts
 RestrictSUIDSGID=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

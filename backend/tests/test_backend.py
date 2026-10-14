@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from appki.auth import InvalidTelegramData, token_hash, validate_init_data
+from appki.catalog import ArtifactRegistry
 from appki.config import Settings
 from appki.db import Database
 from appki.main import create_app
@@ -88,6 +89,8 @@ def configured(tmp_path, monkeypatch):
     cfg = Settings(_env_file=None, database_path=tmp_path / 'db.sqlite3', static_dir=tmp_path / 'dist',
                    happ_ipa_path=ipa_path, happ_ipa_sha256=hashlib.sha256(ipa_path.read_bytes()).hexdigest(),
                    happ_price_rub='1.00',
+                   artifact_registry_path=tmp_path/'artifacts'/'registry.json', artifact_root=tmp_path/'artifacts',
+                   activation_profiles_path=tmp_path/'activation-profiles.json',
                    bot_token=BOT_TOKEN, yookassa_shop_id='12345', yookassa_secret_key='test_local_fake_only',
                    public_base_url='https://example.test', support_url='https://t.me/example_support')
     fake = FakePayments()
@@ -126,6 +129,36 @@ def grant(configured):
     assert response.status_code == 200
     path = urlsplit(response.json()['url']).path
     return headers, result, payment_id, path
+
+
+def release_fixture(cfg, tmp_path, *, slug='happ', bundle='su.ffg.happ', account='account-a',
+                    profile='profile-a', version='2.0', price='1.00'):
+    source = tmp_path/f'{slug}-{account}-{version}.ipa'
+    with zipfile.ZipFile(source, 'w') as archive:
+        archive.writestr('Payload/Fixture.app/Info.plist', plistlib.dumps({
+            'CFBundleIdentifier': bundle, 'CFBundleShortVersionString': version,
+            'CFBundleVersion': version, 'MinimumOSVersion': '15.0'}))
+        archive.writestr('Payload/Fixture.app/Fixture', f'{slug}:{account}:{version}'.encode())
+    registry = ArtifactRegistry(cfg.artifact_registry_path, cfg.artifact_root)
+    record = registry.import_ipa(source, app_slug=slug, title='Happ' if slug == 'happ' else 'V2RayTun',
+                                 expected_bundle_id=bundle, source_account_id=account, activation_profile_id=profile)
+    registry.set_product(slug, {'price_rub': price})
+    registry.publish(slug, record['id'])
+    return record, source.read_bytes()
+
+
+def settle_order(client, fake, result):
+    payment_id = next(identifier for identifier, value in fake.values.items()
+                      if value['metadata']['order_id'] == result['id'])
+    fake.values[payment_id].update(status='succeeded', paid=True)
+    response = client.post('/api/payments/yookassa/webhook', json={
+        'event': 'payment.succeeded', 'object': {'id': payment_id}})
+    assert response.status_code == 200
+
+
+def profile_fixture(cfg, profiles):
+    cfg.activation_profiles_path.write_text(json.dumps({'profiles': profiles}))
+    cfg.activation_profiles_path.chmod(0o600)
 
 
 def test_hmac_tampering_and_age():
@@ -508,7 +541,7 @@ def test_multi_item_checkout_has_one_payment_and_independent_steps_and_files(con
     second_path = tmp_path/'second.ipa'
     with zipfile.ZipFile(second_path, 'w') as archive:
         archive.writestr('Payload/Happ.app/Info.plist', plistlib.dumps({
-            'CFBundleIdentifier': 'test.fixture.second', 'CFBundleVersion': 'second-fixture',
+            'CFBundleIdentifier': 'test.fixture.second', 'CFBundleVersion': '2-fixture',
             'CFBundleShortVersionString': '1.0', 'MinimumOSVersion': '15.0'}))
         archive.writestr('Payload/Happ.app/Happ', b'isolated-second-application-fixture')
     second = IPAFile(second_path, hashlib.sha256(second_path.read_bytes()).hexdigest(),
@@ -944,3 +977,185 @@ def test_planned_listing_cannot_serve_installation_even_if_referenced_by_a_paid_
     with app.state.db.connection() as conn:
         assert conn.execute('SELECT COUNT(*) FROM install_grants').fetchone()[0] == 1
     assert len(fake.keys) == 1
+
+
+def test_legacy_grants_keep_original_file_and_activation_after_publish_and_restart(configured, tmp_path):
+    cfg, fake, app, client = configured
+    cfg.activation_mode = 'credentials'
+    cfg.activation_apple_id, cfg.activation_password = 'legacy@example.test', 'legacy-secret'
+    owner, purchased, _, path = grant(configured)
+    original = cfg.happ_ipa_path.read_bytes()
+    record, replacement = release_fixture(cfg, tmp_path, account='account-new', profile='profile-new')
+    profile_fixture(cfg, {'profile-new': {'mode': 'credentials', 'account_id': 'account-new',
+                                        'apple_id': 'new@example.test', 'password': 'new-secret'}})
+    assert client.get('/api/apps/happ').json()['version'] == '2.0'
+    assert client.get(path+'/app.ipa').content == original != replacement
+    assert client.get(f"/api/orders/{purchased['id']}/activation", headers=owner).json()['password'] == 'legacy-secret'
+    again = client.post(f"/api/orders/{purchased['id']}/install-link", headers=owner)
+    assert client.get(urlsplit(again.json()['url']).path+'/app.ipa').content == original
+    with app.state.db.connection() as conn:
+        pinned = conn.execute('SELECT artifact_id FROM order_items WHERE order_id=?', (purchased['id'],)).fetchone()[0]
+        assert pinned != record['id'] and pinned.startswith('legacy-')
+        assert conn.execute('SELECT COUNT(DISTINCT artifact_id) FROM install_grants WHERE order_id=?',
+                            (purchased['id'],)).fetchone()[0] == 1
+    with TestClient(create_app(cfg, payment_client=fake)) as restarted:
+        assert restarted.get('/api/apps/happ').json()['version'] == '2.0'
+        assert restarted.get(path+'/app.ipa').content == original
+        assert restarted.get(f"/api/orders/{purchased['id']}/activation", headers=owner).json()['apple_id'] == 'legacy@example.test'
+        order_response = restarted.get(f"/api/orders/{purchased['id']}", headers=owner).json()
+        assert order_response['status'] == 'succeeded' and order_response['amount_rub'] == '1.00'
+
+
+def test_imported_order_item_pins_release_and_account_on_first_activation(configured, tmp_path):
+    cfg, fake, app, client = configured
+    first, first_bytes = release_fixture(cfg, tmp_path)
+    profile_fixture(cfg, {
+        'profile-a': {'mode': 'credentials', 'account_id': 'account-a', 'apple_id': 'a@example.test', 'password': 'secret-a'},
+        'profile-b': {'mode': 'credentials', 'account_id': 'account-b', 'apple_id': 'b@example.test', 'password': 'secret-b'},
+    })
+    owner = login(client)
+    purchased = order(client, owner, 'first-artifact-order')
+    settle_order(client, fake, purchased)
+    base = f"/api/orders/{purchased['id']}/items/happ"
+    assert client.get(base+'/activation', headers=owner).json()['password'] == 'secret-a'
+    second, second_bytes = release_fixture(cfg, tmp_path, account='account-b', profile='profile-b', version='3.0')
+    assert client.get('/api/apps/happ').json()['version'] == '3.0'
+    install = client.post(base+'/install-link', headers=owner)
+    path = urlsplit(install.json()['url']).path
+    assert client.get(path+'/app.ipa').content == first_bytes != second_bytes
+    assert client.get(base+'/activation', headers=owner).json()['apple_id'] == 'a@example.test'
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT artifact_id FROM order_items WHERE order_id=?', (purchased['id'],)).fetchone()[0] == first['id']
+        assert conn.execute('SELECT artifact_id FROM install_grants WHERE order_id=?', (purchased['id'],)).fetchone()[0] == first['id']
+    with TestClient(create_app(cfg, payment_client=fake)) as restarted:
+        assert restarted.get(path+'/app.ipa').content == first_bytes
+        assert restarted.get(base+'/activation', headers=owner).json()['password'] == 'secret-a'
+        newcomer = login(restarted, 222)
+        latest = order(restarted, newcomer, 'latest-artifact-order')
+        settle_order(restarted, fake, latest)
+        latest_base = f"/api/orders/{latest['id']}/items/happ"
+        assert restarted.get(latest_base+'/activation', headers=newcomer).json()['password'] == 'secret-b'
+        newest = restarted.post(latest_base+'/install-link', headers=newcomer)
+        assert restarted.get(urlsplit(newest.json()['url']).path+'/app.ipa').content == second_bytes
+        assert first['id'] != second['id']
+
+
+def test_mixed_app_artifacts_keep_distinct_accounts_and_never_leak_private_catalog_data(configured, tmp_path):
+    cfg, fake, app, client = configured
+    happ, happ_bytes = release_fixture(cfg, tmp_path, account='private-account-a', profile='private-profile-a')
+    v2, v2_bytes = release_fixture(cfg, tmp_path, slug='v2raytun', bundle='test.fixture.v2raytun',
+                                  account='private-account-b', profile='private-profile-b', price='2.50')
+    profile_fixture(cfg, {
+        'private-profile-a': {'mode': 'credentials', 'account_id': 'private-account-a',
+                              'apple_id': 'a@example.test', 'password': 'secret-a'},
+        'private-profile-b': {'mode': 'credentials', 'account_id': 'private-account-b',
+                              'apple_id': 'b@example.test', 'password': 'secret-b'},
+    })
+    public = client.get('/api/apps').json()
+    allowed = {'slug', 'title', 'subtitle', 'description', 'category', 'features', 'price_rub',
+               'coming_soon', 'version', 'size_bytes', 'minimum_ios', 'available'}
+    assert all(set(item) == allowed for item in public['items'])
+    encoded = json.dumps(public)
+    for private in [happ['path'], v2['path'], 'private-account-a', 'private-account-b',
+                    'private-profile-a', 'private-profile-b', 'secret-a', 'secret-b', 'app_store_id', 'expected_bundle_id']:
+        assert private not in encoded
+    owner = login(client)
+    outsider = login(client, 222)
+    response = client.post('/api/orders', headers=owner, json={
+        'app_slugs': ['happ', 'v2raytun'], 'request_id': 'mixed-profile-order', 'expected_amount_rub': '3.50'})
+    assert response.status_code == 200
+    purchased = response.json()
+    settle_order(client, fake, purchased)
+    for slug, expected, password in [('happ', happ_bytes, 'secret-a'), ('v2raytun', v2_bytes, 'secret-b')]:
+        base = f"/api/orders/{purchased['id']}/items/{slug}"
+        assert client.get(base+'/activation', headers=outsider).status_code == 404
+        assert client.get(base+'/activation', headers=owner).json()['password'] == password
+        link = client.post(base+'/install-link', headers=owner)
+        assert client.get(urlsplit(link.json()['url']).path+'/app.ipa').content == expected
+    public_order = json.dumps(client.get(f"/api/orders/{purchased['id']}", headers=owner).json())
+    assert 'private-account' not in public_order and 'private-profile' not in public_order and 'artifact_id' not in public_order
+
+
+@pytest.mark.parametrize('configured_profile', ['absent', 'wrong_account', 'matching'])
+def test_imported_artifact_activation_never_inherits_global_legacy_credentials(configured, tmp_path, configured_profile):
+    cfg, fake, app, client = configured
+    cfg.activation_mode = 'credentials'
+    cfg.activation_apple_id, cfg.activation_password = 'legacy-private@example.test', 'legacy-private-password'
+    release_fixture(cfg, tmp_path)
+    if configured_profile != 'absent':
+        profile_fixture(cfg, {'profile-a': {'mode': 'credentials',
+            'account_id': 'account-a' if configured_profile == 'matching' else 'different-account',
+            'apple_id': 'imported@example.test', 'password': 'imported-password'}})
+    owner = login(client)
+    purchased = order(client, owner, 'activation-account-order')
+    settle_order(client, fake, purchased)
+    response = client.get(f"/api/orders/{purchased['id']}/items/happ/activation", headers=owner)
+    assert 'legacy-private' not in response.text
+    if configured_profile == 'wrong_account':
+        assert response.status_code == 503 and 'imported-password' not in response.text
+    elif configured_profile == 'matching':
+        assert response.status_code == 200 and response.json()['password'] == 'imported-password'
+    else:
+        assert response.status_code == 200 and response.json()['mode'] == 'manual'
+        assert 'apple_id' not in response.json() and 'password' not in response.json()
+
+
+def test_artifact_migration_preserves_old_reported_flags_and_payment_snapshot(configured, tmp_path):
+    cfg, fake, app, client = configured
+    owner, purchased, _ = paid(configured)
+    state = client.patch(f"/api/orders/{purchased['id']}/items/happ/state", headers=owner,
+                         json={'installed': True, 'activated': True}).json()
+    with app.state.db.connection(write=True) as conn:
+        before = tuple(conn.execute('SELECT * FROM orders WHERE id=?', (purchased['id'],)).fetchone())
+        conn.execute('ALTER TABLE order_items DROP COLUMN artifact_id')
+        conn.execute('ALTER TABLE install_grants DROP COLUMN artifact_id')
+        conn.execute('DROP TABLE artifact_snapshots')
+    new_release, _ = release_fixture(cfg, tmp_path)
+    with TestClient(create_app(cfg, payment_client=fake)) as restarted:
+        item = restarted.get(f"/api/orders/{purchased['id']}", headers=owner).json()['items'][0]
+        assert item['installed_at'] == state['installed_at'] and item['activated_at'] == state['activated_at']
+        with app.state.db.connection() as conn:
+            assert tuple(conn.execute('SELECT * FROM orders WHERE id=?', (purchased['id'],)).fetchone()) == before
+            pinned = conn.execute('SELECT artifact_id FROM order_items WHERE order_id=?', (purchased['id'],)).fetchone()[0]
+            assert pinned.startswith('legacy-') and pinned != new_release['id']
+
+
+def test_new_reported_steps_do_not_acquire_legacy_activation_on_restart(configured, tmp_path):
+    cfg, fake, app, client = configured
+    imported, _ = release_fixture(cfg, tmp_path)
+    cfg.activation_mode = 'credentials'
+    cfg.activation_apple_id, cfg.activation_password = 'legacy@example.test', 'legacy-secret'
+    owner = login(client)
+    purchased = order(client, owner, 'new-reported-state')
+    settle_order(client, fake, purchased)
+    client.patch(f"/api/orders/{purchased['id']}/items/happ/state", headers=owner,
+                 json={'installed': True, 'activated': True})
+    with TestClient(create_app(cfg, payment_client=fake)) as restarted:
+        result = restarted.get(f"/api/orders/{purchased['id']}/items/happ/activation", headers=owner)
+        assert result.status_code == 200 and result.json()['mode'] == 'manual'
+        assert 'legacy-secret' not in result.text and 'password' not in result.json()
+        with app.state.db.connection() as conn:
+            assert conn.execute('SELECT artifact_id FROM order_items WHERE order_id=?', (purchased['id'],)).fetchone()[0] == imported['id']
+
+
+def test_pinned_account_cannot_be_reassigned_through_a_profile_or_snapshot(configured, tmp_path):
+    cfg, fake, app, client = configured
+    imported, _ = release_fixture(cfg, tmp_path)
+    profile_fixture(cfg, {'profile-a': {'mode': 'credentials', 'account_id': 'account-a',
+                                      'apple_id': 'a@example.test', 'password': 'secret-a'}})
+    owner = login(client)
+    purchased = order(client, owner, 'immutable-account-order')
+    settle_order(client, fake, purchased)
+    path = f"/api/orders/{purchased['id']}/items/happ/activation"
+    assert client.get(path, headers=owner).json()['password'] == 'secret-a'
+    profile_fixture(cfg, {'profile-a': {'mode': 'credentials', 'account_id': 'account-b',
+                                      'apple_id': 'b@example.test', 'password': 'secret-b'}})
+    response = client.get(path, headers=owner)
+    assert response.status_code == 503 and 'secret-b' not in response.text
+    with app.state.db.connection(write=True) as conn:
+        saved = conn.execute('SELECT record_json FROM artifact_snapshots WHERE id=?', (imported['id'],)).fetchone()[0]
+        altered = json.loads(saved)
+        altered['source_account_id'] = 'account-b'
+        conn.execute('UPDATE artifact_snapshots SET record_json=? WHERE id=?', (json.dumps(altered), imported['id']))
+    response = client.get(path, headers=owner)
+    assert response.status_code == 503 and 'secret-b' not in response.text

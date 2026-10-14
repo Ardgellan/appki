@@ -1,0 +1,385 @@
+--- a/cmd/appki_private.go
++++ b/cmd/appki_private.go
+@@ -0,0 +1,60 @@
++package cmd
++
++import (
++	"errors"
++	"github.com/majd/ipatool/v2/pkg/appstore"
++	"github.com/spf13/cobra"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++func preparePrivateAdapter(cmd *cobra.Command) error {
++	if keychainPassphrase != "" {
++		return errors.New("secret_argument_disabled")
++	}
++	for _, name := range []string{"email", "password", "auth-code", "verbose", "purchase"} {
++		if flag := cmd.Flag(name); flag != nil && flag.Changed {
++			return errors.New("unsafe_argument_disabled")
++		}
++	}
++	if !filepath.IsAbs(keychainPassphraseFile) {
++		return errors.New("private_passphrase_required")
++	}
++	info, err := os.Lstat(keychainPassphraseFile)
++	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
++		return errors.New("private_passphrase_unavailable")
++	}
++	if info.Size() < 32 || info.Size() > 4096 {
++		return errors.New("private_passphrase_unavailable")
++	}
++	bytes, err := os.ReadFile(keychainPassphraseFile)
++	if err != nil {
++		return errors.New("private_passphrase_unavailable")
++	}
++	keychainPassphrase = strings.TrimSpace(string(bytes))
++	if len(keychainPassphrase) < 32 {
++		return errors.New("private_passphrase_unavailable")
++	}
++	return nil
++}
++
++// Never send arbitrary Apple response bodies, metadata or credentials to logs.
++func privateErrorCode(err error) string {
++	if errors.Is(err, appstore.ErrAuthCodeRequired) {
++		return "requires_2fa"
++	}
++	text := strings.ToLower(err.Error())
++	if strings.Contains(text, "account_identity_mismatch") {
++		return "account_identity_mismatch"
++	}
++	if strings.Contains(text, "license") {
++		return "license_required"
++	}
++	for _, value := range []string{"failed to get account", "password token", "invalid credentials", "authentication", "sign-in", "account is disabled", "password is required", "email is required"} {
++		if strings.Contains(text, value) {
++			return "requires_auth"
++		}
++	}
++	return "acquisition_failed"
++}
+--- a/cmd/appki_private_test.go
++++ b/cmd/appki_private_test.go
+@@ -0,0 +1,30 @@
++package cmd
++
++import (
++	"github.com/spf13/cobra"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestPrivatePassphraseFile(t *testing.T) {
++	keychainPassphrase = ""
++	keychainPassphraseFile = filepath.Join(t.TempDir(), "passphrase")
++	if err := os.WriteFile(keychainPassphraseFile, []byte("abcdefghijklmnopqrstuvwxyz0123456789"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := preparePrivateAdapter(&cobra.Command{}); err != nil {
++		t.Fatal(err)
++	}
++	if keychainPassphrase != "abcdefghijklmnopqrstuvwxyz0123456789" {
++		t.Fatal("file input failed")
++	}
++	keychainPassphrase = ""
++	if err := os.Chmod(keychainPassphraseFile, 0644); err != nil {
++		t.Fatal(err)
++	}
++	if err := preparePrivateAdapter(&cobra.Command{}); err == nil {
++		t.Fatal("public file accepted")
++	}
++	keychainPassphrase = ""
++}
+--- a/cmd/auth.go
++++ b/cmd/auth.go
+@@ -37,7 +37,7 @@
+ 			}
+ 
+ 			if email == "" && interactive {
+-				value, err := readPrompt("enter email: ", false)
++				value, err := readPrompt("enter Apple Account: ", true)
+ 				if err != nil {
+ 					return fmt.Errorf("failed to read email: %w", err)
+ 				}
+@@ -64,7 +64,7 @@
+ 			return retry.Do(func() error {
+ 				if errors.Is(lastErr, appstore.ErrAuthCodeRequired) && interactive {
+ 					var err error
+-					authCode, err = readPrompt("enter 2FA code: ", false)
++					authCode, err = readPrompt("enter 2FA code: ", true)
+ 					if err != nil {
+ 						return fmt.Errorf("failed to read auth code: %w", err)
+ 					}
+@@ -84,15 +84,14 @@
+ 					if errors.Is(err, appstore.ErrAuthCodeRequired) && !interactive {
+ 						dependencies.Logger.Log().Msg("2FA code is required; run the command again and supply a code using the `--auth-code` flag")
+ 
+-						return nil
++						return appstore.ErrAuthCodeRequired
+ 					}
+ 
+ 					return err
+ 				}
+ 
+ 				dependencies.Logger.Log().
+-					Str("name", output.Account.Name).
+-					Str("email", output.Account.Email).
++					Str("account_identity_sha256", appstore.PrivateAccountIdentity(output.Account.Email)).
+ 					Bool("success", true).
+ 					Send()
+ 
+@@ -130,8 +129,7 @@
+ 			}
+ 
+ 			dependencies.Logger.Log().
+-				Str("name", output.Account.Name).
+-				Str("email", output.Account.Email).
++				Str("account_identity_sha256", appstore.PrivateAccountIdentity(output.Account.Email)).
+ 				Bool("success", true).
+ 				Send()
+ 
+--- a/cmd/common.go
++++ b/cmd/common.go
+@@ -23,6 +23,7 @@
+ 
+ var dependencies = Dependencies{}
+ var keychainPassphrase string
++var keychainPassphraseFile string
+ 
+ type Dependencies struct {
+ 	Logger    log.Logger
+@@ -61,11 +62,7 @@
+ // newKeychain returns a new keychain instance.
+ func newKeychain(stateDirectory string, interactive bool) keychain.Keychain {
+ 	ring := util.Must(openKeyring(keyring.Config{
+-		AllowedBackends: []keyring.BackendType{
+-			keyring.KeychainBackend,
+-			keyring.SecretServiceBackend,
+-			keyring.FileBackend,
+-		},
++		AllowedBackends:          []keyring.BackendType{keyring.FileBackend},
+ 		ServiceName:              KeychainServiceName,
+ 		KeychainTrustApplication: true,
+ 		FileDir:                  stateDirectory,
+--- a/cmd/root.go
++++ b/cmd/root.go
+@@ -2,10 +2,8 @@
+ 
+ import (
+ 	"context"
+-	"errors"
+ 	"reflect"
+ 
+-	"github.com/majd/ipatool/v2/pkg/appstore"
+ 	"github.com/spf13/cobra"
+ 	"github.com/thediveo/enumflag/v2"
+ )
+@@ -29,10 +27,14 @@
+ 		SilenceErrors: true,
+ 		SilenceUsage:  true,
+ 		Version:       version,
+-		PersistentPreRun: func(cmd *cobra.Command, args []string) {
++		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
++			if err := preparePrivateAdapter(cmd); err != nil {
++				return err
++			}
+ 			ctx := context.WithValue(context.Background(), interactiveKey, !nonInteractive)
+ 			cmd.SetContext(ctx)
+ 			initWithCommand(cmd)
++			return nil
+ 		},
+ 	}
+ 
+@@ -43,12 +45,12 @@
+ 		}, enumflag.EnumCaseSensitive), "format", "", "sets output format for command; can be 'text', 'json'")
+ 	cmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "enables verbose logs")
+ 	cmd.PersistentFlags().BoolVarP(&nonInteractive, "non-interactive", "", false, "run in non-interactive session")
+-	cmd.PersistentFlags().StringVar(&keychainPassphrase, "keychain-passphrase", "", "passphrase for unlocking keychain")
++	cmd.PersistentFlags().StringVar(&keychainPassphrase, "keychain-passphrase", "", "disabled in private adapter")
++	cmd.PersistentFlags().StringVar(&keychainPassphraseFile, "keychain-passphrase-file", "", "protected passphrase file")
+ 
+ 	cmd.AddCommand(authCmd())
+ 	cmd.AddCommand(downloadCmd())
+ 	cmd.AddCommand(listPurchasesCmd())
+-	cmd.AddCommand(purchaseCmd())
+ 	cmd.AddCommand(searchCmd())
+ 	cmd.AddCommand(ListVersionsCmd())
+ 	cmd.AddCommand(getVersionMetadataCmd())
+@@ -63,21 +65,11 @@
+ 
+ 	if err != nil {
+ 		if reflect.ValueOf(dependencies).IsZero() {
+-			initWithCommand(cmd)
+-		}
+-
+-		var appstoreErr *appstore.Error
+-		if errors.As(err, &appstoreErr) {
+-			dependencies.Logger.Verbose().Stack().
+-				Err(err).
+-				Interface("metadata", appstoreErr.Metadata).
+-				Send()
+-		} else {
+-			dependencies.Logger.Verbose().Stack().Err(err).Send()
++			dependencies.Logger = newLogger(OutputFormatJSON, false)
+ 		}
+ 
+ 		dependencies.Logger.Error().
+-			Err(err).
++			Str("error", privateErrorCode(err)).
+ 			Bool("success", false).
+ 			Send()
+ 
+--- a/cmd/state_directory.go
++++ b/cmd/state_directory.go
+@@ -1,61 +1,20 @@
+ package cmd
+ 
+ import (
+-	"fmt"
++	"errors"
++	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
+ 	"path/filepath"
+-	"strings"
+-
+-	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
+ )
+ 
+-// prepareStateDirectory resolves and migrates session storage before it is opened.
+-func prepareStateDirectory(os operatingsystem.OperatingSystem, homeDirectory string) (string, error) {
+-	legacyDirectory := filepath.Join(homeDirectory, ConfigDirectoryName)
+-	stateDirectory := legacyDirectory
+-
+-	for _, variable := range []string{"XDG_STATE_HOME", "XDG_DATA_HOME"} {
+-		if base := os.Getenv(variable); filepath.IsAbs(base) {
+-			stateDirectory = filepath.Join(base, "ipatool")
+-
+-			break
+-		}
++// Private adapter: never migrate or fall back to a shared home/keychain.
++func prepareStateDirectory(os operatingsystem.OperatingSystem, _ string) (string, error) {
++	base := os.Getenv("XDG_STATE_HOME")
++	if !filepath.IsAbs(base) {
++		return "", errors.New("private_state_required")
+ 	}
+-
+-	info, err := os.Stat(legacyDirectory)
+-	if err != nil && !os.IsNotExist(err) {
+-		return "", fmt.Errorf("could not read legacy state directory metadata: %w", err)
++	directory := filepath.Join(base, "ipatool")
++	if err := os.MkdirAll(directory, 0700); err != nil {
++		return "", errors.New("private_state_unavailable")
+ 	}
+-
+-	if err == nil {
+-		if !info.IsDir() {
+-			return "", fmt.Errorf("legacy state path is not a directory: %s", legacyDirectory)
+-		}
+-		// Never merge sessions or move a directory into itself. Keeping the legacy
+-		// directory also preserves authentication when migration is unavailable.
+-		relative, err := filepath.Rel(legacyDirectory, stateDirectory)
+-		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+-			return legacyDirectory, nil
+-		}
+-
+-		if _, err := os.Stat(stateDirectory); err == nil || !os.IsNotExist(err) {
+-			return legacyDirectory, nil
+-		}
+-
+-		if err := os.MkdirAll(filepath.Dir(stateDirectory), 0700); err != nil {
+-			return legacyDirectory, nil
+-		}
+-		// Rename keeps cookies and encrypted credentials together, with their
+-		// existing permissions. Cross-filesystem moves fall back to legacy storage.
+-		if err := os.Rename(legacyDirectory, stateDirectory); err != nil {
+-			return legacyDirectory, nil
+-		}
+-
+-		return stateDirectory, nil
+-	}
+-
+-	if err := os.MkdirAll(stateDirectory, 0700); err != nil {
+-		return "", fmt.Errorf("failed to create state directory: %w", err)
+-	}
+-
+-	return stateDirectory, nil
++	return directory, nil
+ }
+--- a/pkg/appstore/appki_private.go
++++ b/pkg/appstore/appki_private.go
+@@ -0,0 +1,22 @@
++package appstore
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"os"
++	"strings"
++)
++
++func PrivateAccountIdentity(email string) string {
++	digest := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email))))
++	return hex.EncodeToString(digest[:])
++}
++
++func validatePrivateAccount(email string) error {
++	expected := os.Getenv("APPKI_EXPECTED_ACCOUNT_SHA256")
++	if expected != "" && PrivateAccountIdentity(email) != expected {
++		return errors.New("account_identity_mismatch")
++	}
++	return nil
++}
+--- a/pkg/appstore/appki_private_test.go
++++ b/pkg/appstore/appki_private_test.go
+@@ -0,0 +1,13 @@
++package appstore
++
++import "testing"
++
++func TestPrivateAccountBinding(t *testing.T) {
++	t.Setenv("APPKI_EXPECTED_ACCOUNT_SHA256", PrivateAccountIdentity("owner@example.invalid"))
++	if err := validatePrivateAccount(" OWNER@example.invalid "); err != nil {
++		t.Fatal(err)
++	}
++	if err := validatePrivateAccount("other@example.invalid"); err == nil {
++		t.Fatal("different account accepted")
++	}
++}
+--- a/pkg/appstore/appstore_account_info.go
++++ b/pkg/appstore/appstore_account_info.go
+@@ -22,6 +22,9 @@
+ 		return AccountInfoOutput{}, fmt.Errorf("failed to unmarshal json: %w", err)
+ 	}
+ 
++	if err := validatePrivateAccount(acc.Email); err != nil {
++		return AccountInfoOutput{}, err
++	}
+ 	return AccountInfoOutput{
+ 		Account: acc,
+ 	}, nil
+--- a/pkg/appstore/appstore_login.go
++++ b/pkg/appstore/appstore_login.go
+@@ -37,6 +37,9 @@
+ }
+ 
+ func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
++	if err := validatePrivateAccount(input.Email); err != nil {
++		return LoginOutput{}, err
++	}
+ 	macAddr, err := t.machine.MacAddress()
+ 	if err != nil {
+ 		return LoginOutput{}, fmt.Errorf("failed to get mac address: %w", err)
+@@ -171,6 +174,9 @@
+ 		Pod:                 pod,
+ 	}
+ 
++	if err := validatePrivateAccount(acc.Email); err != nil {
++		return Account{}, err
++	}
+ 	data, err := json.Marshal(acc)
+ 	if err != nil {
+ 		return Account{}, fmt.Errorf("failed to marshal json: %w", err)

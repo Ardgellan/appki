@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
+from pathlib import Path
 import re
 import secrets
 import time
@@ -17,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictBool, ValidationError, model_validator
 
 from .auth import InvalidTelegramData, token_hash, validate_init_data
+from .catalog import ArtifactRegistry, legacy_artifact, load_products, resolve_artifact
 from .config import Settings
 from .db import Database
 from .ota import INSTALL_PAGE_HEADERS, IPAFile, PRIVATE_HEADERS
@@ -74,29 +76,63 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         raise RuntimeError('Invalid Appki configuration; check environment settings.') from None
     db = Database(cfg.database_path)
     ipa = IPAFile(cfg.happ_ipa_path, cfg.happ_ipa_sha256)
-    # Planned listings have no installation file or sale price. Tests can inject isolated fixtures.
-    products = catalog_items if catalog_items is not None else {
-        'happ': {'title': 'Happ', 'subtitle': 'Ваши VPN-подписки в одном приложении',
-                 'description': 'Клиент для подключения через Xray. Установка оригинального приложения на iPhone с пошаговой помощью в активации. VPN-подписка приобретается отдельно.',
-                 'price_rub': cfg.happ_price_rub, 'category': 'VPN', 'coming_soon': False,
-                 'features': ['Оригинальная сборка', 'Установка через Safari', 'Инструкция по активации'],
-                 'ipa': ipa},
-        **{slug: {'title': title, 'subtitle': subtitle, 'description': description,
-                  'price_rub': None, 'category': category, 'features': [], 'coming_soon': True, 'ipa': None}
-           for slug, title, category, subtitle, description in [
-               ('v2raytun', 'V2RayTun', 'VPN', 'VPN-клиент',
-                'VPN-клиент для подключения через ваши подписки. VPN-серверы приобретаются отдельно.'),
-               ('sber', 'Сбер', 'Банки', 'Мобильный банк',
-                'Банковское приложение для повседневных операций.'),
-               ('tbank', 'Т-Банк', 'Банки', 'Мобильный банк',
-                'Банковское приложение для повседневных операций.'),
-               ('vtb', 'ВТБ-Банк', 'Банки', 'Мобильный банк',
-                'Банковское приложение для повседневных операций.'),
-               ('chatgpt', 'ChatGPT', 'ИИ', 'ИИ-ассистент',
-                'Помощь с вопросами, текстами и повседневными задачами.'),
-               ('deepseek', 'DeepSeek', 'ИИ', 'ИИ-ассистент',
-                'ИИ-ассистент для вопросов и работы с текстом.')]}
-    }
+    registry = ArtifactRegistry(cfg.artifact_registry_path, cfg.artifact_root)
+    legacy_products = catalog_items if catalog_items is not None else {'happ': {'title': 'Happ', 'ipa': ipa}}
+    products, product_signature = {}, None
+
+    def current_products():
+        nonlocal products, product_signature
+        if catalog_items is not None:
+            return catalog_items
+        definition = cfg.catalog_definition_path or Path(__file__).with_name('catalog.json')
+        try:
+            signature = []
+            for path in (cfg.artifact_registry_path, definition):
+                try:
+                    stat = Path(path).stat()
+                    signature.append((stat.st_ino, stat.st_size, stat.st_mtime_ns))
+                except FileNotFoundError:
+                    signature.append(None)
+            signature.append(cfg.happ_price_rub)
+            signature = tuple(signature)
+            if signature != product_signature:
+                products = load_products(cfg, registry)
+                product_signature = signature
+            return products
+        except (OSError, ValueError, TypeError, KeyError):
+            raise HTTPException(503, 'Каталог временно недоступен.') from None
+
+    def save_artifact(conn, record, *, legacy=False):
+        conn.execute('INSERT OR IGNORE INTO artifact_snapshots (id,record_json,legacy) VALUES (?,?,?)',
+                     (record['id'], json.dumps(record, ensure_ascii=False, sort_keys=True), int(legacy)))
+
+    def artifact_snapshot(artifact_id, conn=None):
+        if conn is None:
+            with db.connection() as connection:
+                row = connection.execute('SELECT record_json,legacy FROM artifact_snapshots WHERE id=?',
+                                         (artifact_id,)).fetchone()
+        else:
+            row = conn.execute('SELECT record_json,legacy FROM artifact_snapshots WHERE id=?', (artifact_id,)).fetchone()
+        try:
+            if row is not None:
+                return json.loads(row['record_json']), bool(row['legacy'])
+            return registry.get(artifact_id), False
+        except (OSError, ValueError, TypeError, KeyError):
+            raise HTTPException(503, 'Данные установки временно недоступны.') from None
+
+    def artifact_file(record):
+        try:
+            return resolve_artifact(record)
+        except (OSError, ValueError, TypeError, KeyError):
+            raise HTTPException(503, 'Файл приложения временно недоступен.') from None
+
+    def legacy_record(slug):
+        product = legacy_products.get(slug)
+        if product is None or product.get('ipa') is None:
+            return None
+        return legacy_artifact(slug, product)
+
+    current_products()
     payment = payment_client
     if payment is None and cfg.payments_configured:
         try:
@@ -122,12 +158,29 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
     async def lifespan(app):
         db.initialize()
         with db.connection(write=True) as conn:
-            for slug, product in products.items():
+            for slug, product in current_products().items():
                 app_file = product.get('ipa')
                 conn.execute('INSERT OR REPLACE INTO apps VALUES (?,?,?,?,?)',
                              (slug, product['title'], app_file.version if app_file is not None else '',
                               app_file.size if app_file is not None else 0,
                               int(app_file is not None and not product.get('coming_soon', False) and app_file.available)))
+            for slug in legacy_products:
+                record = legacy_record(slug)
+                if record is None:
+                    continue
+                save_artifact(conn, record, legacy=True)
+                # Old links and reported installation steps refer to the original
+                # file, never to a newly published release for the same slug.
+                conn.execute('UPDATE install_grants SET artifact_id=? WHERE app_slug=? AND artifact_id IS NULL',
+                             (record['id'], slug))
+                conn.execute('''UPDATE order_items SET artifact_id=? WHERE app_slug=? AND artifact_id IS NULL
+                    AND EXISTS(
+                        SELECT 1 FROM install_grants g WHERE g.order_id=order_items.order_id
+                        AND g.app_slug=order_items.app_slug AND g.artifact_id=?)''',
+                    (record['id'], slug, record['id']))
+                if db.legacy_item_migration:
+                    conn.execute('''UPDATE order_items SET artifact_id=? WHERE app_slug=? AND artifact_id IS NULL
+                        AND (installed_at IS NOT NULL OR activated_at IS NOT NULL)''', (record['id'], slug))
             conn.execute('DELETE FROM sessions WHERE expires_at <= ?', (int(time.time()),))
             conn.execute('DELETE FROM install_grants WHERE expires_at <= ?', (int(time.time()),))
         yield
@@ -138,6 +191,7 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
     app.state.db = db
     app.state.ipa = ipa
     app.state.settings = cfg
+    app.state.artifact_registry = registry
 
     @app.middleware('http')
     async def security_headers(request, call_next):
@@ -188,16 +242,17 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         return dict(row)
 
     def catalog(slug):
-        product = products.get(slug)
+        product = current_products().get(slug)
         if product is None:
             raise HTTPException(404, 'Приложение не найдено.')
         app_file = product.get('ipa')
+        if product.get('artifact') is not None:
+            app_file = artifact_file(product['artifact'])
         coming_soon = bool(product.get('coming_soon', False))
         available = app_file is not None and not coming_soon and app_file.refresh()
-        public = {key: value for key, value in product.items() if key != 'ipa'}
+        public = {key: product[key] for key in ('title', 'subtitle', 'description', 'price_rub', 'category', 'features')
+                  if key in product}
         public['coming_soon'] = coming_soon
-        if catalog_items is None and slug == 'happ':
-            public['price_rub'] = cfg.happ_price_rub
         if coming_soon:
             public['price_rub'] = None
         return {**public,
@@ -211,16 +266,19 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
                 'SELECT * FROM order_items WHERE order_id=? ORDER BY app_slug', (order_id,)).fetchall()]
 
     def item_view(item, order):
-        product = products.get(item['app_slug'])
-        app_file = product.get('ipa') if product is not None else None
+        if item.get('artifact_id'):
+            record, _ = artifact_snapshot(item['artifact_id'])
+            app_file = artifact_file(record) if record is not None and record['app_slug'] == item['app_slug'] else None
+        else:
+            product = current_products().get(item['app_slug'])
+            app_file = (product.get('ipa') if product is not None and not product.get('coming_soon', False) else None)
         return {'app_slug': item['app_slug'], 'app_title': item['app_title'],
                 'amount_rub': item['amount_rub'], 'installed': item['installed_at'] is not None,
                 'activated': item['activated_at'] is not None,
                 'installed_at': iso(item['installed_at']), 'activated_at': iso(item['activated_at']),
                 'can_install': (order['status'] == 'succeeded' and
                                 bool(order['test']) == (cfg.yookassa_mode == 'test') and
-                                product is not None and not product.get('coming_soon', False)
-                                and app_file is not None and app_file.available)}
+                                app_file is not None and app_file.available)}
 
     def owned_order(order_id, user_id):
         with db.connection() as conn:
@@ -308,6 +366,82 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
             raise HTTPException(404, 'Приложение в заказе не найдено.')
         return row, item
 
+    def pin_item_artifact(order_id, user_id, app_slug=None):
+        _, item = paid_item(order_id, user_id, app_slug)
+        selected, selected_legacy = None, False
+        if not item['artifact_id']:
+            product = current_products().get(item['app_slug'])
+            if product is None or product.get('coming_soon', False) or product.get('ipa') is None:
+                raise HTTPException(503, 'Установка и активация этого приложения пока недоступны.')
+            selected = product.get('artifact')
+            if selected is None:
+                selected = legacy_artifact(item['app_slug'], product)
+                selected_legacy = True
+            if selected['app_slug'] != item['app_slug']:
+                raise HTTPException(503, 'Данные установки временно недоступны.')
+        with db.connection(write=True) as conn:
+            order = conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?', (order_id, user_id)).fetchone()
+            if order is None:
+                raise HTTPException(404, 'Заказ не найден.')
+            if order['status'] != 'succeeded' or bool(order['test']) != (cfg.yookassa_mode == 'test'):
+                raise HTTPException(403, 'Доступ к заказу закрыт.')
+            item = dict(conn.execute('SELECT * FROM order_items WHERE order_id=? AND app_slug=?',
+                                     (order_id, item['app_slug'])).fetchone())
+            if item['artifact_id']:
+                record, is_legacy = artifact_snapshot(item['artifact_id'], conn)
+            else:
+                save_artifact(conn, selected, legacy=selected_legacy)
+                record, is_legacy = artifact_snapshot(selected['id'], conn)
+                conn.execute('UPDATE order_items SET artifact_id=? WHERE order_id=? AND app_slug=?',
+                             (record['id'], order_id, item['app_slug']))
+                item['artifact_id'] = record['id']
+            if record is None or record['app_slug'] != item['app_slug']:
+                raise HTTPException(503, 'Данные установки временно недоступны.')
+        return item, record, is_legacy
+
+    def activation_profile(record, is_legacy):
+        if is_legacy:
+            if (not record['id'].startswith('legacy-') or record['source_account_id'] is not None
+                    or record['activation_profile_id'] != 'legacy'):
+                raise HTTPException(503, 'Инструкция активации временно недоступна. Обратитесь в поддержку.')
+            result = {'mode': cfg.activation_mode, 'instructions': cfg.activation_instructions,
+                      'support_url': cfg.support_url}
+            if cfg.activation_mode == 'credentials':
+                result.update(apple_id=cfg.activation_apple_id, password=cfg.activation_password)
+            return result
+        fallback = {'mode': 'manual', 'instructions': cfg.activation_instructions, 'support_url': cfg.support_url}
+        try:
+            path = Path(cfg.activation_profiles_path)
+            if path.is_symlink():
+                raise ValueError('Invalid profile file')
+            if not path.is_file():
+                return fallback
+            if path.stat().st_size > 1024 * 1024:
+                raise ValueError('Invalid profile file')
+            data = json.loads(path.read_text())
+            profiles = data['profiles']
+            if not isinstance(profiles, dict):
+                raise ValueError('Invalid profiles')
+            profile = profiles.get(record['activation_profile_id'])
+            if profile is None:
+                return fallback
+            if (not isinstance(profile, dict) or not record['source_account_id'] or
+                    profile.get('account_id') != record['source_account_id']):
+                raise ValueError('Activation account mismatch')
+            mode = profile.get('mode', 'manual')
+            instructions, support = profile.get('instructions', cfg.activation_instructions), profile.get('support_url', cfg.support_url)
+            if mode not in ('manual', 'credentials') or not isinstance(instructions, str) or not isinstance(support, str):
+                raise ValueError('Invalid profile')
+            result = {'mode': mode, 'instructions': instructions, 'support_url': support}
+            if mode == 'credentials':
+                apple_id, password = profile.get('apple_id'), profile.get('password')
+                if not isinstance(apple_id, str) or not apple_id or not isinstance(password, str) or not password:
+                    raise ValueError('Incomplete credentials')
+                result.update(apple_id=apple_id, password=password)
+            return result
+        except (OSError, ValueError, TypeError, KeyError):
+            raise HTTPException(503, 'Инструкция активации временно недоступна. Обратитесь в поддержку.') from None
+
     @app.get('/healthz')
     def health():
         with db.connection() as conn:
@@ -322,7 +456,7 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
 
     @app.get('/api/apps')
     def apps():
-        return {'items': [catalog(slug) for slug in products]}
+        return {'items': [catalog(slug) for slug in current_products()]}
 
     @app.get('/api/apps/{slug}')
     def one_app(slug: str):
@@ -513,10 +647,9 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         return order_view(row)
 
     def issue_install_link(order_id, user_id, app_slug=None):
-        _, item = paid_item(order_id, user_id, app_slug)
-        product = products.get(item['app_slug'])
-        if (product is None or product.get('coming_soon', False) or product.get('ipa') is None
-                or not product['ipa'].refresh()):
+        item, record, _ = pin_item_artifact(order_id, user_id, app_slug)
+        app_file = artifact_file(record)
+        if not app_file.refresh():
             raise HTTPException(503, 'Файл приложения временно недоступен.')
         rate_limit(('grants', user_id), 20)
         token = secrets.token_hex(32)
@@ -526,8 +659,12 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
             row = conn.execute('SELECT status,test FROM orders WHERE id=? AND user_id=?', (order_id, user_id)).fetchone()
             if row is None or row['status'] != 'succeeded' or bool(row['test']) != (cfg.yookassa_mode == 'test'):
                 raise HTTPException(403, 'Доступ к заказу закрыт.')
-            conn.execute('''INSERT INTO install_grants (token_hash,order_id,expires_at,revoked,app_slug)
-                VALUES (?,?,?,0,?)''', (token_hash(token), order_id, expires, item['app_slug']))
+            pinned = conn.execute('SELECT artifact_id FROM order_items WHERE order_id=? AND app_slug=?',
+                                  (order_id, item['app_slug'])).fetchone()
+            if pinned is None or pinned['artifact_id'] != record['id']:
+                raise HTTPException(403, 'Доступ к установке закрыт.')
+            conn.execute('''INSERT INTO install_grants (token_hash,order_id,expires_at,revoked,app_slug,artifact_id)
+                VALUES (?,?,?,0,?,?)''', (token_hash(token), order_id, expires, item['app_slug'], record['id']))
             conn.execute('DELETE FROM install_grants WHERE expires_at<=?', (int(time.time()),))
         return {'url': f'{cfg.public_base_url}/install/{token}', 'expires_at': iso(expires)}
 
@@ -540,14 +677,11 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         return issue_install_link(order_id, user['id'], app_slug)
 
     def activation_for_item(order_id, user_id, app_slug=None):
-        _, item = paid_item(order_id, user_id, app_slug)
-        product = products.get(item['app_slug'])
-        if product is None or product.get('coming_soon', False) or product.get('ipa') is None:
-            raise HTTPException(503, 'Установка и активация этого приложения пока недоступны.')
-        result = {'mode': cfg.activation_mode, 'instructions': cfg.activation_instructions, 'support_url': cfg.support_url}
-        if cfg.activation_mode == 'credentials':
-            result.update(apple_id=cfg.activation_apple_id, password=cfg.activation_password)
-        return result
+        _, record, is_legacy = pin_item_artifact(order_id, user_id, app_slug)
+        # Validate cached identity/provenance too, even when returning only an
+        # activation instruction rather than opening a download stream.
+        artifact_file(record)
+        return activation_profile(record, is_legacy)
 
     @app.get('/api/orders/{order_id}/activation')
     def activation(order_id: str, user=Depends(current_user)):
@@ -628,7 +762,7 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         if request.url.query or not re.fullmatch('[0-9a-f]{64}', token):
             raise HTTPException(404, 'Ссылка не найдена.')
         with db.connection() as conn:
-            row = conn.execute('''SELECT g.expires_at,g.revoked,g.app_slug,o.status,o.test FROM install_grants g
+            row = conn.execute('''SELECT g.expires_at,g.revoked,g.app_slug,g.artifact_id,g.order_id,o.status,o.test FROM install_grants g
                 JOIN orders o ON o.id=g.order_id
                 JOIN order_items i ON i.order_id=g.order_id AND i.app_slug=g.app_slug
                 WHERE g.token_hash=?''', (token_hash(token),)).fetchone()
@@ -637,11 +771,23 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         if (row['expires_at'] <= int(time.time()) or row['revoked'] or row['status'] != 'succeeded'
                 or bool(row['test']) != (cfg.yookassa_mode == 'test')):
             raise HTTPException(410, 'Ссылка истекла. Получите новую в своём заказе.')
-        product = products.get(row['app_slug'])
-        if (product is None or product.get('coming_soon', False) or product.get('ipa') is None
-                or not product['ipa'].refresh()):
+        if row['artifact_id']:
+            record, _ = artifact_snapshot(row['artifact_id'])
+        else:
+            record = legacy_record(row['app_slug'])
+            if record is not None:
+                with db.connection(write=True) as conn:
+                    save_artifact(conn, record, legacy=True)
+                    conn.execute('UPDATE install_grants SET artifact_id=? WHERE token_hash=? AND artifact_id IS NULL',
+                                 (record['id'], token_hash(token)))
+                    conn.execute('UPDATE order_items SET artifact_id=? WHERE order_id=? AND app_slug=? AND artifact_id IS NULL',
+                                 (record['id'], row['order_id'], row['app_slug']))
+        if record is None or record['app_slug'] != row['app_slug']:
             raise HTTPException(503, 'Файл приложения временно недоступен.')
-        return product['ipa']
+        app_file = artifact_file(record)
+        if not app_file.refresh():
+            raise HTTPException(503, 'Файл приложения временно недоступен.')
+        return app_file
 
     @app.api_route('/install/{token}', methods=['GET', 'HEAD'])
     def install_page(token: str, request: Request):
@@ -671,7 +817,7 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
             raise HTTPException(404, 'Страница не найдена.')
         # Explicit SPA allowlist prevents accidentally exposing config/IPA files or future routes.
         order_uuid = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
-        catalog_page = path.startswith('apps/') and path[5:] in products
+        catalog_page = path.startswith('apps/') and path[5:] in current_products()
         item_page = re.fullmatch(rf'orders/{order_uuid}/apps/[a-z0-9-]{{1,64}}', path)
         payment_page = re.fullmatch(rf'payment/{order_uuid}', path)
         if (path not in ('', 'orders', 'help', 'how-it-works', 'payment/return') and not catalog_page

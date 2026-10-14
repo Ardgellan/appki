@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     happ_ipa_path: Path = Path('/var/lib/appki/apps/Happ.ipa')
     happ_ipa_sha256: str = '94e9591fe92be4589c19344ab7089d0b6abe101cf9cfa7a80707d6c390a4a2f2'
     happ_price_rub: str = '490.00'
+    catalog_definition_path: Path | None = None
+    artifact_registry_path: Path = Path('/var/lib/appki/artifacts/registry.json')
+    artifact_root: Path = Path('/var/lib/appki/artifacts')
+    activation_profiles_path: Path = Path('/etc/appki/activation-profiles.json')
     yookassa_shop_id: str = ''
     yookassa_secret_key: str = ''
     yookassa_mode: str = 'test'
@@ -29,7 +33,7 @@ class Settings(BaseSettings):
     activation_password: str = ''
     activation_instructions: str = (
         'После установки может понадобиться авторизация установочного Apple Account. '
-        'Напишите в поддержку и укажите номер заказа: мы поможем с активацией. '
+        'Если приложение не запускается, обратитесь в поддержку. '
         'Вход выполняется только в «Контент и покупки», без выхода из iCloud. '
         'После первого успешного запуска вернитесь в свой аккаунт.'
     )

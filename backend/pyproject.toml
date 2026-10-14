@@ -21,6 +21,9 @@ test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2"]
 where = ["."]
 include = ["appki*"]
 
+[tool.setuptools.package-data]
+appki = ["catalog.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

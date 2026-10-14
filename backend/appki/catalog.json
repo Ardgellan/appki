@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "products": {
+    "happ": {
+      "title": "Happ",
+      "subtitle": "Ваши VPN-подписки в одном приложении",
+      "description": "Клиент для подключения через Xray. Установка оригинального приложения на iPhone с пошаговой помощью в активации. VPN-подписка приобретается отдельно.",
+      "price_rub": "490.00",
+      "category": "VPN",
+      "coming_soon": false,
+      "features": ["Оригинальная сборка", "Установка через Safari", "Инструкция по активации"],
+      "app_store_id": null,
+      "expected_bundle_id": "su.ffg.happ"
+    },
+    "v2raytun": {
+      "title": "V2RayTun",
+      "subtitle": "VPN-клиент",
+      "description": "VPN-клиент для подключения через ваши подписки. VPN-серверы приобретаются отдельно.",
+      "price_rub": null,
+      "category": "VPN",
+      "coming_soon": true,
+      "features": [],
+      "app_store_id": null,
+      "expected_bundle_id": null
+    },
+    "sber": {
+      "title": "Сбер",
+      "subtitle": "Мобильный банк",
+      "description": "Банковское приложение для повседневных операций.",
+      "price_rub": null,
+      "category": "Банки",
+      "coming_soon": true,
+      "features": [],
+      "app_store_id": null,
+      "expected_bundle_id": null
+    },
+    "tbank": {
+      "title": "Т-Банк",
+      "subtitle": "Мобильный банк",
+      "description": "Банковское приложение для повседневных операций.",
+      "price_rub": null,
+      "category": "Банки",
+      "coming_soon": true,
+      "features": [],
+      "app_store_id": null,
+      "expected_bundle_id": null
+    },
+    "vtb": {
+      "title": "ВТБ-Банк",
+      "subtitle": "Мобильный банк",
+      "description": "Банковское приложение для повседневных операций.",
+      "price_rub": null,
+      "category": "Банки",
+      "coming_soon": true,
+      "features": [],
+      "app_store_id": null,
+      "expected_bundle_id": null
+    },
+    "chatgpt": {
+      "title": "ChatGPT",
+      "subtitle": "ИИ-ассистент",
+      "description": "Помощь с вопросами, текстами и повседневными задачами.",
+      "price_rub": null,
+      "category": "ИИ",
+      "coming_soon": true,
+      "features": [],
+      "app_store_id": null,
+      "expected_bundle_id": null
+    },
+    "deepseek": {
+      "title": "DeepSeek",
+      "subtitle": "ИИ-ассистент",
+      "description": "ИИ-ассистент для вопросов и работы с текстом.",
+      "price_rub": null,
+      "category": "ИИ",
+      "coming_soon": true,
+      "features": [],
+      "app_store_id": null,
+      "expected_bundle_id": null
+    }
+  }
+}

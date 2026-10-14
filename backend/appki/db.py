@@ -27,20 +27,25 @@ CREATE INDEX IF NOT EXISTS orders_user ON orders(user_id, created_at);
 CREATE TABLE IF NOT EXISTS order_items (
  order_id TEXT NOT NULL REFERENCES orders(id), app_slug TEXT NOT NULL,
  app_title TEXT NOT NULL, amount_rub TEXT NOT NULL,
- installed_at INTEGER, activated_at INTEGER,
+ installed_at INTEGER, activated_at INTEGER, artifact_id TEXT,
  PRIMARY KEY(order_id, app_slug), CHECK(activated_at IS NULL OR installed_at IS NOT NULL)
 );
 CREATE TABLE IF NOT EXISTS install_grants (
  token_hash TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id), expires_at INTEGER NOT NULL,
- revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)), app_slug TEXT NOT NULL
+ revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)), app_slug TEXT NOT NULL, artifact_id TEXT
 );
 CREATE INDEX IF NOT EXISTS grants_expiry ON install_grants(expires_at);
+CREATE TABLE IF NOT EXISTS artifact_snapshots (
+ id TEXT PRIMARY KEY, record_json TEXT NOT NULL,
+ legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1))
+);
 '''
 
 
 class Database:
     def __init__(self, path: Path):
         self.path = Path(path)
+        self.legacy_item_migration = False
 
     def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +59,12 @@ class Database:
             columns = {row['name'] for row in conn.execute('PRAGMA table_info(install_grants)')}
             if 'app_slug' not in columns:
                 conn.execute('ALTER TABLE install_grants ADD COLUMN app_slug TEXT')
+            if 'artifact_id' not in columns:
+                conn.execute('ALTER TABLE install_grants ADD COLUMN artifact_id TEXT')
+            item_columns = {row['name'] for row in conn.execute('PRAGMA table_info(order_items)')}
+            self.legacy_item_migration = 'artifact_id' not in item_columns
+            if 'artifact_id' not in item_columns:
+                conn.execute('ALTER TABLE order_items ADD COLUMN artifact_id TEXT')
             conn.execute('''UPDATE install_grants SET app_slug=(
                 SELECT app_slug FROM orders WHERE orders.id=install_grants.order_id)
                 WHERE app_slug IS NULL''')
