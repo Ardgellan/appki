@@ -583,7 +583,7 @@ def test_spa_payment_and_item_routes_serve_only_public_shell(configured):
     shell = '<!doctype html><html><body>public application shell</body></html>'
     (cfg.static_dir/'index.html').write_text(shell)
     order_id = str(uuid.uuid4())
-    for path in ['/', '/orders', '/help', '/apps/happ', '/payment/return', f'/orders/{order_id}',
+    for path in ['/', '/orders', '/help', '/how-it-works', '/apps/happ', '/payment/return', f'/orders/{order_id}',
                  f'/payment/{order_id}', f'/orders/{order_id}/apps/happ',
                  f'/orders/{order_id}/apps/historical-app']:
         response = client.get(path)

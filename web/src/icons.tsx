@@ -23,6 +23,12 @@ export function Icon({
         <path d="m3 12 9 5 9-5M3 16l9 5 9-5" />
       </>
     ),
+    guide: (
+      <>
+        <rect x="4" y="3" width="16" height="18" rx="2" />
+        <path d="M8 7h8M8 11h8M8 15h5" />
+      </>
+    ),
     help: (
       <>
         <circle cx="12" cy="12" r="9" />

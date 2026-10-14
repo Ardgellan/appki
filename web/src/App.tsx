@@ -203,9 +203,15 @@ function Navigation() {
             path.startsWith("/payment"),
         },
         {
+          route: "/how-it-works",
+          icon: "guide",
+          text: "Как это работает",
+          active: path === "/how-it-works",
+        },
+        {
           route: "/orders",
           icon: "stack",
-          text: "Мои приложения",
+          text: "Приложения",
           active: path.startsWith("/orders"),
         },
         {
@@ -427,6 +433,50 @@ function Catalog() {
   );
 }
 
+function InstallationInstructions() {
+  return (
+    <div className="instruction-copy">
+      <section>
+        <h3>1. Установка приложения</h3>
+        <p>
+          После оплаты откройте «Мои приложения» и выберите приложение. Получите
+          персональную ссылку, откройте её в Safari на iPhone и подтвердите
+          установку. Ссылка действует ограниченное время — новую можно получить
+          в том же заказе.
+        </p>
+      </section>
+      <section>
+        <h3>2. Активация</h3>
+        <p>
+          Для первого запуска может понадобиться авторизация установочного Apple
+          Account. Инструкция и помощь доступны в оплаченном заказе. Вход
+          выполняется только в App Store или «Контент и покупки», без выхода из
+          основного iCloud.
+        </p>
+      </section>
+      <section>
+        <h3>3. Первый запуск</h3>
+        <p>
+          После успешного запуска вернитесь в свой аккаунт App Store. Установка
+          не переносит приложение в покупки вашего Apple Account. Подписки
+          сторонних сервисов и VPN-серверы приобретаются отдельно. Перед
+          переустановкой сохраните настройки существующей копии.
+        </p>
+      </section>
+    </div>
+  );
+}
+function HowItWorks() {
+  return (
+    <section>
+      <div className="page-heading">
+        <h1>Как это работает</h1>
+        <p>Установка и активация</p>
+      </div>
+      <InstallationInstructions />
+    </section>
+  );
+}
 function CheckoutDialog({
   selection,
   onClose,
@@ -566,36 +616,7 @@ function CheckoutDialog({
         <div className="instruction-body">
           <p className="muted small-text">Перед покупкой</p>
           <h2>Установка и активация</h2>
-          <div className="instruction-copy">
-            <section>
-              <h3>1. Установка приложения</h3>
-              <p>
-                После оплаты откройте «Мои приложения» и выберите приложение.
-                Получите персональную ссылку, откройте её в Safari на iPhone и
-                подтвердите установку. Ссылка действует ограниченное время —
-                новую можно получить в том же заказе.
-              </p>
-            </section>
-            <section>
-              <h3>2. Активация</h3>
-              <p>
-                Для первого запуска может понадобиться авторизация установочного
-                Apple Account. Инструкция и помощь доступны в оплаченном заказе.
-                Вход выполняется только в App Store или «Контент и покупки», без
-                выхода из основного iCloud.
-              </p>
-            </section>
-            <section>
-              <h3>3. Первый запуск</h3>
-              <p>
-                После успешного запуска вернитесь в свой аккаунт App Store.
-                Установка не переносит приложение в покупки вашего Apple
-                Account. Подписки сторонних сервисов и VPN-серверы приобретаются
-                отдельно. Перед переустановкой сохраните настройки существующей
-                копии.
-              </p>
-            </section>
-          </div>
+          <InstallationInstructions />
           <div className="checkout-review">
             <h2>Ваш заказ</h2>
             <p className="muted small-text">Доступ к установке приложений</p>
@@ -1521,6 +1542,7 @@ function Route() {
   const { path } = useApp();
   if (path === "/") return null;
   if (path === "/orders") return <Orders />;
+  if (path === "/how-it-works") return <HowItWorks />;
   if (path === "/help") return <Help />;
   if (path.startsWith("/apps/")) return null;
   if (path === "/payment/return")

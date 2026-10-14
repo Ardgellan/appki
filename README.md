@@ -42,7 +42,7 @@ https://85.239.144.214/api/payments/yookassa/webhook
 
 ## Страницы и API
 
-Каталог и корзина находятся на `/`, подробности Happ — на `/apps/happ`, покупки — на `/orders`. Оплата открывается на `/payment/{order_id}`, установка и активация конкретного приложения — на `/orders/{order_id}/apps/{slug}`. Сохранены страница заказа `/orders/{order_id}`, помощь `/help` и возврат из ЮKassa `/payment/return?order_id=...`.
+Каталог и корзина находятся на `/`, подробности Happ — на `/apps/happ`, покупки — на `/orders`, публичный раздел «Как это работает» — на `/how-it-works`. Оплата открывается на `/payment/{order_id}`, установка и активация конкретного приложения — на `/orders/{order_id}/apps/{slug}`. Сохранены страница заказа `/orders/{order_id}`, помощь `/help` и возврат из ЮKassa `/payment/return?order_id=...`.
 
 Корзина отправляет `POST /api/orders` с `app_slugs`, `request_id` и подтверждённой `expected_amount_rub`. Сервер возвращает `items` и итог `total_rub`; при изменении цены отвечает 409 до создания платежа. Для каждой позиции доступны `POST .../items/{slug}/install-link`, `GET .../items/{slug}/activation` и `PATCH .../items/{slug}/state` внутри `/api/orders/{order_id}`. Старый запрос с `app_slug` и ссылки без позиции сохранены для заказов из одного приложения. Полные поля и правила повторов — в [контракте API](API_CONTRACT.md).
 

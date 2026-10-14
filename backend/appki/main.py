@@ -562,7 +562,7 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         catalog_page = path.startswith('apps/') and path[5:] in products
         item_page = re.fullmatch(rf'orders/{order_uuid}/apps/[a-z0-9-]{{1,64}}', path)
         payment_page = re.fullmatch(rf'payment/{order_uuid}', path)
-        if (path not in ('', 'orders', 'help', 'payment/return') and not catalog_page
+        if (path not in ('', 'orders', 'help', 'how-it-works', 'payment/return') and not catalog_page
                 and not re.fullmatch(r'orders/[0-9a-f-]{36}', path) and not item_page and not payment_page):
             raise HTTPException(404, 'Страница не найдена.')
         index = cfg.static_dir / 'index.html'
