@@ -883,25 +883,6 @@ h1.page-heading {
   width: 100%;
   margin-top: 14px;
 }
-.checkout-method {
-  margin-top: 10px;
-  color: var(--muted);
-  font-size: 11px;
-  text-align: center;
-}
-
-.payment-method {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 17px;
-  color: var(--muted);
-  font-size: 12px;
-}
-.payment-method svg {
-  width: 19px;
-  height: 19px;
-}
 .payment-amount {
   margin: 23px 0 10px;
   font-size: 38px;
@@ -985,13 +966,6 @@ h1.page-heading {
 .flow-heading p {
   color: var(--muted);
   font-size: 12px;
-}
-.order-reference {
-  margin: 24px 0 0;
-  color: var(--muted);
-  font-size: 10px;
-  text-align: center;
-  overflow-wrap: anywhere;
 }
 .status {
   display: inline-flex;
