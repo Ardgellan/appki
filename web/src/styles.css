@@ -12,6 +12,8 @@
   --line: #e3e3e3;
   --surface: #f1f1f1;
   --radius: 16px;
+  --cart-pill-height: 76px;
+  --cart-pill-gap: 12px;
   --app-safe-top: max(
     env(safe-area-inset-top, 0px),
     var(--tg-content-safe-area-inset-top, 0px)
@@ -155,23 +157,30 @@ summary:focus-visible {
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
 }
+.app-shell[data-cart-visible="true"] .app-main {
+  padding-bottom: calc(26px + var(--cart-pill-height) + var(--cart-pill-gap));
+}
 .app-main::-webkit-scrollbar,
 .instruction-body::-webkit-scrollbar {
   display: none;
 }
 .app-footer {
+  position: relative;
   z-index: 3;
   flex-shrink: 0;
   padding-bottom: var(--app-safe-bottom);
-  background: #fff;
+  background: transparent;
+  pointer-events: none;
 }
 .bottom-nav {
+  position: relative;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px;
   padding: 15px 16px 17px;
   border-top: 1px solid var(--line);
   background: #fff;
+  pointer-events: auto;
 }
 .bottom-nav button {
   display: flex;
@@ -202,26 +211,41 @@ summary:focus-visible {
   color: var(--accent);
 }
 .cart-summary {
+  position: absolute;
+  right: 12px;
+  bottom: calc(100% + var(--cart-pill-gap));
+  left: 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
-  padding: 16px 22px;
-  border-top: 1px solid var(--line);
-  background: #fff;
+  gap: 8px;
+  min-height: var(--cart-pill-height);
+  padding: 11px 10px 11px 23px;
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.38);
+  -webkit-backdrop-filter: blur(8px) saturate(145%);
+  backdrop-filter: blur(8px) saturate(145%);
+  box-shadow:
+    0 9px 30px rgba(26, 44, 79, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  pointer-events: auto;
 }
 .cart-summary-copy {
   display: grid;
-  gap: 6px;
+  gap: 3px;
   flex-shrink: 0;
+  min-width: 80px;
 }
 .cart-summary-count {
-  color: var(--muted);
-  font-size: 12px;
+  color: #686868;
+  font-size: 11px;
+  white-space: nowrap;
 }
 .cart-summary-total {
-  font-size: 23px;
-  font-weight: 750;
+  color: var(--ink);
+  font-size: 25px;
+  font-weight: 720;
   line-height: 1.1;
   letter-spacing: -0.5px;
 }
@@ -229,8 +253,18 @@ summary:focus-visible {
   width: auto;
   min-width: 0;
   margin: 0;
-  padding: 13px;
-  gap: 7px;
+  min-height: 50px;
+  padding: 0 18px;
+  gap: 9px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--accent);
+  font-size: 14px;
+  white-space: nowrap;
+}
+.cart-summary .button svg {
+  width: 19px;
+  height: 19px;
 }
 
 .catalog-tools {
@@ -342,6 +376,12 @@ summary:focus-visible {
   width: 74%;
   height: 74%;
 }
+.app-icon > img {
+  display: block;
+  width: 74%;
+  height: 74%;
+  object-fit: contain;
+}
 .app-icon.large {
   width: 64px;
   height: 64px;
@@ -391,6 +431,28 @@ summary:focus-visible {
   line-height: 1.2;
   letter-spacing: -0.35px;
   overflow-wrap: anywhere;
+}
+.app-card-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.coming-soon-badge {
+  padding: 3px 6px;
+  border-radius: 6px;
+  color: #656565;
+  background: #e2e2e2;
+  font-size: 10px;
+  font-weight: 550;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.coming-soon-note {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
 }
 .app-card-copy > span,
 .app-card-copy > p {
@@ -1488,6 +1550,9 @@ h1.page-heading {
   }
 }
 @media (max-width: 380px) {
+  :root {
+    --cart-pill-height: 72px;
+  }
   .header {
     padding-right: 17px;
     padding-left: 17px;
@@ -1518,18 +1583,29 @@ h1.page-heading {
     padding-left: 11px;
   }
   .cart-summary {
-    gap: 10px;
-    padding: 15px 17px;
+    right: 9px;
+    left: 9px;
+    gap: 6px;
+    padding: 10px 8px 10px 16px;
   }
   .cart-summary-count {
     font-size: 11px;
   }
   .cart-summary-total {
-    font-size: 21px;
+    font-size: 23px;
+  }
+  .cart-summary-copy {
+    min-width: 74px;
   }
   .cart-summary .button {
-    padding: 12px;
+    min-height: 48px;
+    padding: 0 12px;
+    gap: 6px;
     font-size: 12px;
+  }
+  .cart-summary .button svg {
+    width: 16px;
+    height: 16px;
   }
   .instruction-header {
     padding-left: 17px;
@@ -1563,7 +1639,7 @@ h1.page-heading {
   }
   .cart-summary .button {
     gap: 5px;
-    padding: 12px 10px;
+    padding: 0 10px;
     font-size: 11px;
   }
   .cart-summary .button svg {

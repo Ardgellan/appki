@@ -154,7 +154,8 @@ def test_public_config_no_secrets_and_real_availability(configured):
     assert 'secret' not in json.dumps(body) and BOT_TOKEN not in json.dumps(body)
     assert client.get('/api/apps/happ').json()['available']
     cfg.happ_ipa_path.unlink()
-    assert not client.get('/api/apps/happ').json()['available']
+    unavailable = client.get('/api/apps/happ').json()
+    assert not unavailable['available'] and not unavailable['coming_soon']
     assert client.post('/api/orders', headers=login(client), json={'app_slug':'happ','request_id':'valid-key-1'}).status_code == 503
     assert not fake.keys
 
@@ -513,6 +514,7 @@ def test_multi_item_checkout_has_one_payment_and_independent_steps_and_files(con
     catalog = {'happ': {'title': 'Happ', 'price_rub': '1.00', 'ipa': original_app.state.ipa},
                'second': {'title': 'Second test fixture', 'price_rub': '2.50', 'ipa': second}}
     with TestClient(create_app(isolated_cfg, payment_client=fake, catalog_items=catalog)) as client:
+        assert all(not item['coming_soon'] for item in client.get('/api/apps').json()['items'])
         headers = login(client)
         payload = {'app_slugs': ['second', 'happ'], 'request_id': 'multi-cart', 'expected_amount_rub': '3.50'}
         response = client.post('/api/orders', headers=headers, json=payload)
@@ -796,3 +798,60 @@ def test_paid_order_filter_is_validated_and_not_displaced_by_hidden_drafts(confi
     assert client.get('/api/orders?status=canceled', headers=headers).json()['items'] == []
     assert client.get('/api/orders?status=succeeded', headers=outsider).json()['items'] == []
     assert client.get('/api/orders?status=unknown', headers=headers).status_code == 422
+
+
+def test_default_catalog_lists_seven_products_with_unpriced_planned_apps(configured):
+    cfg, fake, app, client = configured
+    items = client.get('/api/apps').json()['items']
+    assert [(item['slug'], item['title']) for item in items] == [
+        ('happ', 'Happ'), ('v2raytun', 'V2RayTun'), ('sber', 'Сбер'), ('tbank', 'Т-Банк'),
+        ('vtb', 'ВТБ-Банк'), ('chatgpt', 'ChatGPT'), ('deepseek', 'DeepSeek')]
+    assert [item['slug'] for item in items if item['available']] == ['happ']
+    assert items[0]['price_rub'] == cfg.happ_price_rub and not items[0]['coming_soon']
+    for item in items[1:]:
+        assert item['coming_soon'] and not item['available'] and item['price_rub'] is None
+        assert item['version'] == item['minimum_ios'] == '' and item['size_bytes'] == 0
+        assert client.get(f"/api/apps/{item['slug']}").json() == item
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM apps').fetchone()[0] == 7
+    assert fake.keys == [] and fake.gets == []
+
+
+def test_planned_and_mixed_carts_fail_before_saving_orders_or_creating_payments(configured):
+    cfg, fake, app, client = configured
+    headers = login(client)
+    slugs = ['v2raytun', 'sber', 'tbank', 'vtb', 'chatgpt', 'deepseek']
+    for slug in slugs:
+        for selection in [[slug], ['happ', slug]]:
+            response = client.post('/api/orders', headers=headers, json={
+                'app_slugs': selection, 'request_id': f'planned-cart-{slug}-{len(selection)}'})
+            assert response.status_code == 503
+            assert response.json()['detail'] == 'Это приложение готовится к запуску. Оплата пока недоступна.'
+    assert client.post('/api/orders', headers=headers,
+                       json={'app_slug': 'chatgpt', 'request_id': 'legacy-planned-cart'}).status_code == 503
+    assert fake.keys == [] and fake.values == {}
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0] == 0
+        assert conn.execute('SELECT COUNT(*) FROM order_items').fetchone()[0] == 0
+        assert conn.execute('SELECT COUNT(*) FROM install_grants').fetchone()[0] == 0
+
+
+def test_planned_listing_cannot_serve_installation_even_if_referenced_by_a_paid_record(configured):
+    cfg, fake, app, client = configured
+    owner, purchased, _, path = grant(configured)
+    # Simulate a legacy record that references a currently planned product. Its old
+    # grant must not fall back to Happ's file or create a new capability.
+    with app.state.db.connection(write=True) as conn:
+        conn.execute('UPDATE order_items SET app_slug=?,app_title=? WHERE order_id=?',
+                     ('chatgpt', 'ChatGPT', purchased['id']))
+        conn.execute('UPDATE install_grants SET app_slug=? WHERE order_id=?', ('chatgpt', purchased['id']))
+    base = f"/api/orders/{purchased['id']}/items/chatgpt"
+    result = client.get(f"/api/orders/{purchased['id']}", headers=owner).json()
+    assert not result['can_install'] and not result['items'][0]['can_install']
+    assert client.post(base+'/install-link', headers=owner).status_code == 503
+    assert client.get(base+'/activation', headers=owner).status_code == 503
+    for suffix in ['', '/manifest.plist', '/app.ipa']:
+        assert client.get(path+suffix).status_code == 503
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM install_grants').fetchone()[0] == 1
+    assert len(fake.keys) == 1

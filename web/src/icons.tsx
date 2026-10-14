@@ -1,4 +1,8 @@
 import type { CSSProperties, ReactNode } from "react";
+const chatgptLogo = new URL("./assets/app-icons/chatgpt.svg", import.meta.url)
+  .href;
+const deepseekLogo = new URL("./assets/app-icons/deepseek.svg", import.meta.url)
+  .href;
 export function Icon({
   name,
   size = 20,
@@ -194,38 +198,8 @@ export function AppIcon({
         <path d="M14 15h41l-5 9H9l5-9ZM10 29h34l-5 9H5l5-9ZM6 43h27l-5 9H1l5-9Z" />
       </svg>
     ),
-    chatgpt: (
-      <svg viewBox="0 0 64 64" fill="none">
-        <g
-          stroke="currentColor"
-          strokeWidth="3.2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          {[0, 60, 120, 180, 240, 300].map((angle) => (
-            <path
-              key={angle}
-              d="M32 13c5-3 11-1 14 4l5 9c2 5 0 10-5 13l-14 8V25l13-7"
-              transform={`rotate(${angle} 32 32)`}
-            />
-          ))}
-        </g>
-      </svg>
-    ),
-    deepseek: (
-      <svg viewBox="0 0 64 64" fill="currentColor">
-        <path d="M8 31c1-10 10-17 22-16 8 0 15 4 19 10 5-2 7-6 9-10 3 7 2 14-4 20-2 10-10 16-23 16-13 0-23-8-23-20Z" />
-        <path d="M22 45c-1 8 4 12 11 13l-3-11-8-2Z" />
-        <path
-          d="M13 28c5 5 10 7 17 7"
-          fill="none"
-          stroke="#fff"
-          strokeWidth="3"
-          strokeLinecap="round"
-        />
-        <circle cx="35" cy="24" r="2.5" fill="#fff" />
-      </svg>
-    ),
+    chatgpt: <img src={chatgptLogo} alt="" />,
+    deepseek: <img src={deepseekLogo} alt="" />,
     generic: <span>{(title || slug).slice(0, 2).toUpperCase()}</span>,
   };
   return (

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   appCount,
+  canPurchaseApp,
   cartAmount,
   cartRequestKey,
   kopecks,
@@ -9,7 +10,23 @@ import {
   purchasedApps,
   routeForItem,
 } from "../src/checkout.ts";
-import type { Order } from "../src/types.ts";
+import type { AppInfo, Order } from "../src/types.ts";
+
+const app = (overrides: Partial<AppInfo> = {}): AppInfo => ({
+  slug: "happ",
+  title: "Happ",
+  subtitle: "VPN-клиент",
+  description: "Приложение для iPhone.",
+  version: "5.9.0",
+  size_bytes: 305_000_000,
+  minimum_ios: "15.0",
+  price_rub: "1.00",
+  category: "VPN",
+  features: [],
+  available: true,
+  coming_soon: false,
+  ...overrides,
+});
 
 const order = (overrides: Partial<Order> = {}): Order => ({
   id: "order-1",
@@ -51,6 +68,21 @@ test("purchase retries have a stable key regardless of selection order", () => {
     cartRequestKey(["v2ray", "happ", "happ"]),
   );
   assert.notEqual(cartRequestKey(["happ"]), cartRequestKey(["happ", "v2ray"]));
+});
+
+test("unknown planned prices cannot turn into a zero-priced checkout", () => {
+  assert.throws(() => cartAmount([{ price_rub: null }]));
+  assert.throws(() => cartAmount([{ price_rub: "1.00" }, { price_rub: null }]));
+  assert.equal(canPurchaseApp(app()), true);
+  assert.equal(canPurchaseApp(app({ available: false })), false);
+  assert.equal(canPurchaseApp(app({ price_rub: null })), false);
+  assert.equal(canPurchaseApp(app({ coming_soon: true })), false);
+  assert.equal(
+    canPurchaseApp(
+      app({ available: false, coming_soon: true, price_rub: null }),
+    ),
+    false,
+  );
 });
 
 test("legacy orders retain installation access without inventing activation", () => {

@@ -16,12 +16,14 @@ import {
 } from "./api";
 import {
   appCount,
+  canPurchaseApp,
   cartAmount,
   cartRequestKey,
   orderItems,
   purchasedApps,
   routeForItem,
 } from "./checkout";
+import type { PurchasableApp } from "./checkout";
 import { AppIcon, BrandMark, Icon } from "./icons";
 import type {
   Activation,
@@ -237,9 +239,9 @@ function Navigation() {
 }
 function CartSummary() {
   const { apps, cart, path, checkout } = useApp();
-  const selected = apps.filter(
-    (app) => cart.includes(app.slug) && app.available,
-  );
+  const selected = apps
+    .filter(canPurchaseApp)
+    .filter((app) => cart.includes(app.slug));
   if (!selected.length || (path !== "/" && !path.startsWith("/apps/")))
     return null;
   return (
@@ -345,27 +347,42 @@ function Catalog() {
               <div className="app-card-row">
                 <AppIcon slug={app.slug} title={app.title} />
                 <div className="app-card-copy">
-                  <strong>{app.title}</strong>
+                  <div className="app-card-title">
+                    <strong>{app.title}</strong>
+                    {app.coming_soon && (
+                      <span className="coming-soon-badge">Скоро</span>
+                    )}
+                  </div>
                   <span>
-                    {app.category === "VPN" ? "VPN-клиент" : app.subtitle}
+                    {app.coming_soon
+                      ? "Готовим к запуску"
+                      : !app.available
+                        ? "Временно недоступно"
+                        : app.category === "VPN"
+                          ? "VPN-клиент"
+                          : app.subtitle}
                   </span>
                 </div>
                 <div className="card-actions">
-                  <button
-                    type="button"
-                    className="cart-toggle"
-                    aria-label={
-                      purchase
-                        ? `${app.title} уже приобретено`
-                        : `${selected ? "Убрать" : "Добавить"} ${app.title} ${selected ? "из корзины" : "в корзину"}`
-                    }
-                    aria-pressed={selected}
-                    data-owned={Boolean(purchase)}
-                    disabled={!cartReady || !app.available || Boolean(purchase)}
-                    onClick={() => toggleCart(app.slug)}
-                  >
-                    <Icon name="basket" size={10.5} />
-                  </button>
+                  {!app.coming_soon && (
+                    <button
+                      type="button"
+                      className="cart-toggle"
+                      aria-label={
+                        purchase
+                          ? `${app.title} уже приобретено`
+                          : `${selected ? "Убрать" : "Добавить"} ${app.title} ${selected ? "из корзины" : "в корзину"}`
+                      }
+                      aria-pressed={selected}
+                      data-owned={Boolean(purchase)}
+                      disabled={
+                        !cartReady || !canPurchaseApp(app) || Boolean(purchase)
+                      }
+                      onClick={() => toggleCart(app.slug)}
+                    >
+                      <Icon name="basket" size={10.5} />
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="card-expand"
@@ -387,35 +404,49 @@ function Catalog() {
                 <div className="card-dropdown-inner">
                   <div className="card-dropdown-content">
                     <p className="card-description">{app.description}</p>
-                    <Specs app={app} />
-                    <div className="card-price">
-                      <span>Доступ к установке</span>
-                      <strong>{rubles(app.price_rub)}</strong>
-                    </div>
-                    <button
-                      type="button"
-                      className="button card-cta"
-                      disabled={(!app.available || !cartReady) && !purchase}
-                      onClick={(event) =>
-                        purchase
-                          ? navigate(routeForItem(purchase.order.id, app.slug))
-                          : selected
-                            ? checkout(event.currentTarget)
-                            : toggleCart(app.slug)
-                      }
-                    >
-                      {purchase
-                        ? "Открыть в моих приложениях"
-                        : !app.available
-                          ? "Пока недоступно"
-                          : selected
-                            ? "Перейти к оплате"
-                            : "Добавить в корзину"}
-                      <Icon
-                        name={selected || purchase ? "arrow" : "basket"}
-                        size={selected || purchase ? 17 : 10.5}
-                      />
-                    </button>
+                    {app.coming_soon ? (
+                      <p className="coming-soon-note">
+                        Установка станет доступна после запуска.
+                      </p>
+                    ) : (
+                      <>
+                        <Specs app={app} />
+                        {app.price_rub !== null && (
+                          <div className="card-price">
+                            <span>Доступ к установке</span>
+                            <strong>{rubles(app.price_rub)}</strong>
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          className="button card-cta"
+                          disabled={
+                            (!canPurchaseApp(app) || !cartReady) && !purchase
+                          }
+                          onClick={(event) =>
+                            purchase
+                              ? navigate(
+                                  routeForItem(purchase.order.id, app.slug),
+                                )
+                              : selected
+                                ? checkout(event.currentTarget)
+                                : toggleCart(app.slug)
+                          }
+                        >
+                          {purchase
+                            ? "Открыть в моих приложениях"
+                            : !canPurchaseApp(app)
+                              ? "Временно недоступно"
+                              : selected
+                                ? "Перейти к оплате"
+                                : "Добавить в корзину"}
+                          <Icon
+                            name={selected || purchase ? "arrow" : "basket"}
+                            size={selected || purchase ? 17 : 10.5}
+                          />
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
@@ -482,7 +513,7 @@ function CheckoutDialog({
   onClose,
   reloadCatalog,
 }: {
-  selection: AppInfo[];
+  selection: PurchasableApp[];
   onClose: () => void;
   reloadCatalog: () => Promise<void>;
 }) {
@@ -1616,9 +1647,12 @@ export default function App() {
   const [ordersError, setOrdersError] = useState("");
   const [cart, setCart] = useState<string[]>([]);
   const [cartReady, setCartReady] = useState(false);
+  const cartVisible =
+    (path === "/" || path.startsWith("/apps/")) &&
+    apps.some((app) => canPurchaseApp(app) && cart.includes(app.slug));
   const cartRef = useRef<string[]>([]);
   const cartStorageKey = useRef("");
-  const [selection, setSelection] = useState<AppInfo[] | null>(null);
+  const [selection, setSelection] = useState<PurchasableApp[] | null>(null);
   const checkoutAnchor = useRef<HTMLElement | null>(null);
   const main = useRef<HTMLElement>(null);
   const catalogScroll = useRef(0);
@@ -1742,7 +1776,9 @@ export default function App() {
         if (!previous) return null;
         const available = previous
           .map((old) => catalog.items.find((app) => app.slug === old.slug))
-          .filter((app): app is AppInfo => Boolean(app?.available));
+          .filter((app): app is PurchasableApp =>
+            Boolean(app && canPurchaseApp(app)),
+          );
         return available.length ? available : null;
       });
     } catch (cause) {
@@ -1755,7 +1791,7 @@ export default function App() {
     (slug: string) => {
       if (
         !cartReady ||
-        !apps.some((app) => app.slug === slug && app.available) ||
+        !apps.some((app) => app.slug === slug && canPurchaseApp(app)) ||
         purchasedApps(orders, config?.payments_mode ?? "test").some(
           (entry) => entry.item.app_slug === slug,
         )
@@ -1772,9 +1808,9 @@ export default function App() {
   );
   const checkout = useCallback(
     (anchor?: HTMLElement) => {
-      const selected = apps.filter(
-        (app) => cartRef.current.includes(app.slug) && app.available,
-      );
+      const selected = apps
+        .filter(canPurchaseApp)
+        .filter((app) => cartRef.current.includes(app.slug));
       if (!selected.length) return;
       checkoutAnchor.current =
         anchor ??
@@ -1908,7 +1944,7 @@ export default function App() {
             saved.filter(
               (id): id is string =>
                 typeof id === "string" &&
-                apps.some((app) => app.slug === id && app.available),
+                apps.some((app) => app.slug === id && canPurchaseApp(app)),
             ),
           ),
         ]
@@ -1941,7 +1977,7 @@ export default function App() {
     const timer = window.setTimeout(() => setAnnouncement(""), 3500);
     return () => clearTimeout(timer);
   }, [announcement]);
-  useEffect(() => {
+  const keepFocusedControlVisible = useCallback(() => {
     const scroll = main.current;
     const active = document.activeElement;
     if (!scroll || !(active instanceof HTMLElement) || !scroll.contains(active))
@@ -1949,13 +1985,23 @@ export default function App() {
     requestAnimationFrame(() => {
       const box = active.getBoundingClientRect();
       const viewport = scroll.getBoundingClientRect();
-      if (box.bottom > viewport.bottom - 12)
+      const capsule = cartVisible
+        ? scroll.closest(".app-content")?.querySelector(".cart-summary")
+        : null;
+      const bottom = Math.min(
+        viewport.bottom,
+        capsule?.getBoundingClientRect().top ?? viewport.bottom,
+      );
+      if (box.bottom > bottom - 12)
         scroll.scrollBy({
-          top: box.bottom - viewport.bottom + 12,
+          top: box.bottom - bottom + 12,
           behavior: "instant",
         });
     });
-  }, [cart.length]);
+  }, [cartVisible]);
+  useEffect(() => {
+    keepFocusedControlVisible();
+  }, [cart.length, keepFocusedControlVisible]);
   return (
     <Context.Provider
       value={{
@@ -1979,10 +2025,15 @@ export default function App() {
         checkout,
       }}
     >
-      <div className="app-shell">
+      <div className="app-shell" data-cart-visible={cartVisible}>
         <div className="app-content" inert={Boolean(selection)}>
           <Header />
-          <main className="app-main" id="main" ref={main}>
+          <main
+            className="app-main"
+            id="main"
+            ref={main}
+            onFocusCapture={keepFocusedControlVisible}
+          >
             {loading ? (
               <Skeleton />
             ) : error ? (

@@ -1,5 +1,11 @@
 import type { AppInfo, Order, OrderItem } from "./types.ts";
 
+export type PurchasableApp = AppInfo & { price_rub: string };
+
+export function canPurchaseApp(app: AppInfo): app is PurchasableApp {
+  return app.available && !app.coming_soon && typeof app.price_rub === "string";
+}
+
 export function kopecks(amount: string): number {
   if (!/^\d+(?:\.\d{1,2})?$/.test(amount)) {
     throw new Error("Некорректная цена приложения.");
@@ -12,7 +18,11 @@ export function kopecks(amount: string): number {
 }
 
 export function cartAmount(apps: Pick<AppInfo, "price_rub">[]): string {
-  const total = apps.reduce((sum, app) => sum + kopecks(app.price_rub), 0);
+  const total = apps.reduce((sum, app) => {
+    if (app.price_rub === null)
+      throw new Error("Цена приложения ещё не определена.");
+    return sum + kopecks(app.price_rub);
+  }, 0);
   if (!Number.isSafeInteger(total))
     throw new Error("Некорректная сумма заказа.");
   return `${Math.floor(total / 100)}.${String(total % 100).padStart(2, "0")}`;

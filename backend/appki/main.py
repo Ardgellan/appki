@@ -74,13 +74,28 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         raise RuntimeError('Invalid Appki configuration; check environment settings.') from None
     db = Database(cfg.database_path)
     ipa = IPAFile(cfg.happ_ipa_path, cfg.happ_ipa_sha256)
-    # The live catalog contains only configured products. Tests can inject isolated fixtures.
+    # Planned listings have no installation file or sale price. Tests can inject isolated fixtures.
     products = catalog_items if catalog_items is not None else {
         'happ': {'title': 'Happ', 'subtitle': 'Ваши VPN-подписки в одном приложении',
                  'description': 'Клиент для подключения через Xray. Установка оригинального приложения на iPhone с пошаговой помощью в активации. VPN-подписка приобретается отдельно.',
-                 'price_rub': cfg.happ_price_rub, 'category': 'VPN',
+                 'price_rub': cfg.happ_price_rub, 'category': 'VPN', 'coming_soon': False,
                  'features': ['Оригинальная сборка', 'Установка через Safari', 'Инструкция по активации'],
-                 'ipa': ipa}
+                 'ipa': ipa},
+        **{slug: {'title': title, 'subtitle': subtitle, 'description': description,
+                  'price_rub': None, 'category': category, 'features': [], 'coming_soon': True, 'ipa': None}
+           for slug, title, category, subtitle, description in [
+               ('v2raytun', 'V2RayTun', 'VPN', 'VPN-клиент',
+                'VPN-клиент для подключения через ваши подписки. VPN-серверы приобретаются отдельно.'),
+               ('sber', 'Сбер', 'Банки', 'Мобильный банк',
+                'Банковское приложение для повседневных операций.'),
+               ('tbank', 'Т-Банк', 'Банки', 'Мобильный банк',
+                'Банковское приложение для повседневных операций.'),
+               ('vtb', 'ВТБ-Банк', 'Банки', 'Мобильный банк',
+                'Банковское приложение для повседневных операций.'),
+               ('chatgpt', 'ChatGPT', 'ИИ', 'ИИ-ассистент',
+                'Помощь с вопросами, текстами и повседневными задачами.'),
+               ('deepseek', 'DeepSeek', 'ИИ', 'ИИ-ассистент',
+                'ИИ-ассистент для вопросов и работы с текстом.')]}
     }
     payment = payment_client
     if payment is None and cfg.payments_configured:
@@ -108,9 +123,11 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         db.initialize()
         with db.connection(write=True) as conn:
             for slug, product in products.items():
-                app_file = product['ipa']
+                app_file = product.get('ipa')
                 conn.execute('INSERT OR REPLACE INTO apps VALUES (?,?,?,?,?)',
-                             (slug, product['title'], app_file.version, app_file.size, int(app_file.available)))
+                             (slug, product['title'], app_file.version if app_file is not None else '',
+                              app_file.size if app_file is not None else 0,
+                              int(app_file is not None and not product.get('coming_soon', False) and app_file.available)))
             conn.execute('DELETE FROM sessions WHERE expires_at <= ?', (int(time.time()),))
             conn.execute('DELETE FROM install_grants WHERE expires_at <= ?', (int(time.time()),))
         yield
@@ -174,14 +191,19 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         product = products.get(slug)
         if product is None:
             raise HTTPException(404, 'Приложение не найдено.')
-        app_file = product['ipa']
-        available = app_file.refresh()
+        app_file = product.get('ipa')
+        coming_soon = bool(product.get('coming_soon', False))
+        available = app_file is not None and not coming_soon and app_file.refresh()
         public = {key: value for key, value in product.items() if key != 'ipa'}
-        if catalog_items is None:
+        public['coming_soon'] = coming_soon
+        if catalog_items is None and slug == 'happ':
             public['price_rub'] = cfg.happ_price_rub
+        if coming_soon:
+            public['price_rub'] = None
         return {**public,
-                'slug': slug, 'version': app_file.version, 'size_bytes': app_file.size,
-                'minimum_ios': app_file.minimum_ios, 'available': available}
+                'slug': slug, 'version': app_file.version if app_file is not None else '',
+                'size_bytes': app_file.size if app_file is not None else 0,
+                'minimum_ios': app_file.minimum_ios if app_file is not None else '', 'available': available}
 
     def order_items(order_id):
         with db.connection() as conn:
@@ -190,13 +212,15 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
 
     def item_view(item, order):
         product = products.get(item['app_slug'])
+        app_file = product.get('ipa') if product is not None else None
         return {'app_slug': item['app_slug'], 'app_title': item['app_title'],
                 'amount_rub': item['amount_rub'], 'installed': item['installed_at'] is not None,
                 'activated': item['activated_at'] is not None,
                 'installed_at': iso(item['installed_at']), 'activated_at': iso(item['activated_at']),
                 'can_install': (order['status'] == 'succeeded' and
                                 bool(order['test']) == (cfg.yookassa_mode == 'test') and
-                                product is not None and product['ipa'].available)}
+                                product is not None and not product.get('coming_soon', False)
+                                and app_file is not None and app_file.available)}
 
     def owned_order(order_id, user_id):
         with db.connection() as conn:
@@ -353,6 +377,8 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         if payment is None:
             raise HTTPException(503, 'Приём оплаты ещё не настроен.')
         selected = [catalog(slug) for slug in body.slugs]
+        if any(item['coming_soon'] or item.get('price_rub') is None for item in selected):
+            raise HTTPException(503, 'Это приложение готовится к запуску. Оплата пока недоступна.')
         if not all(item['available'] for item in selected):
             raise HTTPException(503, 'Файл приложения временно недоступен. Оплата не создана.')
         total = format(sum((Decimal(item['price_rub']) for item in selected), Decimal('0')), '.2f')
@@ -489,7 +515,8 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
     def issue_install_link(order_id, user_id, app_slug=None):
         _, item = paid_item(order_id, user_id, app_slug)
         product = products.get(item['app_slug'])
-        if product is None or not product['ipa'].refresh():
+        if (product is None or product.get('coming_soon', False) or product.get('ipa') is None
+                or not product['ipa'].refresh()):
             raise HTTPException(503, 'Файл приложения временно недоступен.')
         rate_limit(('grants', user_id), 20)
         token = secrets.token_hex(32)
@@ -513,7 +540,10 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         return issue_install_link(order_id, user['id'], app_slug)
 
     def activation_for_item(order_id, user_id, app_slug=None):
-        paid_item(order_id, user_id, app_slug)
+        _, item = paid_item(order_id, user_id, app_slug)
+        product = products.get(item['app_slug'])
+        if product is None or product.get('coming_soon', False) or product.get('ipa') is None:
+            raise HTTPException(503, 'Установка и активация этого приложения пока недоступны.')
         result = {'mode': cfg.activation_mode, 'instructions': cfg.activation_instructions, 'support_url': cfg.support_url}
         if cfg.activation_mode == 'credentials':
             result.update(apple_id=cfg.activation_apple_id, password=cfg.activation_password)
@@ -608,7 +638,8 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
                 or bool(row['test']) != (cfg.yookassa_mode == 'test')):
             raise HTTPException(410, 'Ссылка истекла. Получите новую в своём заказе.')
         product = products.get(row['app_slug'])
-        if product is None or not product['ipa'].refresh():
+        if (product is None or product.get('coming_soon', False) or product.get('ipa') is None
+                or not product['ipa'].refresh()):
             raise HTTPException(503, 'Файл приложения временно недоступен.')
         return product['ipa']
 

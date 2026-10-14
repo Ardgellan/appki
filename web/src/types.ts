@@ -6,10 +6,11 @@ export interface AppInfo {
   version: string;
   size_bytes: number;
   minimum_ios: string;
-  price_rub: string;
+  price_rub: string | null;
   category: string;
   features: string[];
   available: boolean;
+  coming_soon: boolean;
 }
 export interface Config {
   brand: string;
