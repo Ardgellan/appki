@@ -7,7 +7,10 @@ Never trust webhook payloads or the payment return URL as proof of payment.
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import re
+import socket
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit
@@ -16,6 +19,9 @@ import httpx
 
 
 API_BASE = "https://api.yookassa.ru/v3"
+_API_HOST = "api.yookassa.ru"
+_DNS_TIMEOUT_SECONDS = 5.0
+_MAX_FALLBACK_ADDRESSES = 3
 _PAYMENT_ID = re.compile(r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}\Z")
 _AMOUNT = re.compile(r"(?:0|[1-9][0-9]{0,9})\.[0-9]{2}\Z")
 _SAFE_ID = re.compile(r"[a-zA-Z0-9_-]{1,64}\Z")
@@ -24,7 +30,10 @@ _UNVERIFIED = "Не удалось подтвердить платёж. Дост
 
 
 class PaymentConfigurationError(Exception):
-    """Payment configuration is absent or inconsistent; no request was sent."""
+    """Configuration is invalid or provider credentials were rejected.
+
+    A rejected retry does not resolve an earlier uncertain creation attempt.
+    """
 
 
 class PaymentProviderError(Exception):
@@ -33,6 +42,79 @@ class PaymentProviderError(Exception):
 
 class PaymentValidationError(Exception):
     """An input or provider payment cannot be correlated safely with this order."""
+
+
+async def _resolve_yookassa_addresses() -> list[str]:
+    records = await asyncio.wait_for(
+        asyncio.get_running_loop().getaddrinfo(
+            _API_HOST, 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP,
+        ),
+        timeout=_DNS_TIMEOUT_SECONDS,
+    )
+    addresses = []
+    for family, _, _, _, sockaddr in records:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        try:
+            address = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        if not address.is_global or address.is_multicast or '%' in str(address):
+            continue
+        value = str(address)
+        if value not in addresses:
+            addresses.append(value)
+    return addresses
+
+
+class _YooKassaTransport(httpx.AsyncBaseTransport):
+    """Try DNS alternatives only when TCP/TLS failed before sending HTTP.
+
+    IP URLs are internal routing only. Host and TLS hostname verification remain
+    bound to the official API; see https://www.python-httpx.org/advanced/extensions/.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport | None = None) -> None:
+        self._inner = inner or httpx.AsyncHTTPTransport(trust_env=False, retries=0)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return await self._inner.handle_async_request(request)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            if (request.url.scheme != 'https' or request.url.host != _API_HOST
+                    or request.url.port not in (None, 443)):
+                raise
+            original_error = exc
+        try:
+            addresses = await _resolve_yookassa_addresses()
+        except (OSError, TimeoutError):
+            raise original_error from None
+        # Fresh DNS ordering can differ from the failed hostname lookup. Retain
+        # its first address too, but try the other bounded candidates before it.
+        alternatives = addresses[:_MAX_FALLBACK_ADDRESSES]
+        if len(alternatives) > 1:
+            alternatives = alternatives[1:] + alternatives[:1]
+        if not alternatives:
+            raise original_error from None
+        body = await request.aread()
+        headers = request.headers.copy()
+        headers['Host'] = _API_HOST
+        for address in alternatives:
+            routed = httpx.Request(
+                request.method, request.url.copy_with(host=address), headers=headers,
+                stream=httpx.ByteStream(body),
+                extensions={**request.extensions, 'sni_hostname': _API_HOST},
+            )
+            try:
+                return await self._inner.handle_async_request(routed)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                continue
+        raise original_error from None
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
 
 def _money(value: Any, *, positive: bool = True) -> Decimal:
@@ -158,6 +240,7 @@ class YooKassaClient:
         self._auth = httpx.BasicAuth(shop_id, secret_key)
         self._owned = client is None
         self._client = client or httpx.AsyncClient(
+            transport=_YooKassaTransport(),
             timeout=httpx.Timeout(20.0, connect=5.0),
             follow_redirects=False,
             trust_env=False,

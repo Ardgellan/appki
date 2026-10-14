@@ -670,11 +670,6 @@ function CheckoutDialog({
               <span>К оплате</span>
               <strong>{rubles(cartAmount(selection))}</strong>
             </div>
-            {config?.payments_mode === "test" && (
-              <p className="test-note">
-                Тестовая оплата ЮKassa. Реальные деньги не списываются.
-              </p>
-            )}
             {!user ? (
               <TelegramGate />
             ) : !config?.payments_configured ? (
@@ -724,9 +719,7 @@ function CheckoutDialog({
               <Icon name="arrow" size={17} />
             </Button>
             <p className="muted small-text checkout-method">
-              {config?.payments_mode === "test"
-                ? "Тестовый платёж"
-                : "Через СБП"}
+              Оплата через ЮKassa
             </p>
           </div>
         </div>
@@ -1204,17 +1197,11 @@ function OrderPage({
         <Back />
         <div className="payment-method">
           <Icon name="bank" size={19} />
-          <span>
-            {order.test ? "Тестовая оплата ЮKassa" : "Система быстрых платежей"}
-          </span>
+          <span>Оплата через ЮKassa</span>
         </div>
         <div className="page-heading">
           <h1>
-            {order.status === "pending"
-              ? order.test
-                ? "Тестовая оплата"
-                : "Оплата через СБП"
-              : orderStatus(order.status)}
+            {order.status === "pending" ? "Оплата" : orderStatus(order.status)}
           </h1>
         </div>
         <div className="payment-amount">{rubles(order.amount_rub)}</div>
@@ -1222,9 +1209,6 @@ function OrderPage({
           Доступ к {items.map((item) => item.app_title).join(", ")}
         </p>
         {error && <Notice tone="error">{error}</Notice>}
-        {order.test && (
-          <p className="test-note">Реальные деньги не списываются.</p>
-        )}
         {order.status === "pending" ? (
           <div className="surface payment-panel">
             <h2>
@@ -1232,11 +1216,9 @@ function OrderPage({
                 ? "Нужно уточнить статус оплаты"
                 : order.has_payment && paymentReturn
                   ? "Проверяем результат оплаты"
-                  : order.has_payment && order.test
-                    ? "Оплата на тестовой странице"
-                    : order.has_payment
-                      ? "Оплатите в приложении банка"
-                      : "Создание платежа"}
+                  : order.has_payment
+                    ? "Подтвердите оплату"
+                    : "Создание платежа"}
             </h2>
             {order.requires_payment_review ? (
               <>
@@ -1265,11 +1247,8 @@ function OrderPage({
             ) : order.has_payment ? (
               <>
                 <p>
-                  {order.test
-                    ? "Платёж откроется на тестовой странице ЮKassa."
-                    : "Подтвердите платёж через СБП."}{" "}
-                  После подтверждения сервером приложения появятся в «Моих
-                  приложениях».
+                  Подтвердите платёж на странице оплаты. После подтверждения
+                  сервером приложения появятся в «Моих приложениях».
                 </p>
                 {paymentURL ? (
                   <Button
@@ -1277,8 +1256,7 @@ function OrderPage({
                     busy={checking}
                     onClick={retryPayment}
                   >
-                    Открыть{" "}
-                    {order.test ? "тестовую оплату" : "оплату через СБП"}
+                    Открыть оплату
                     <Icon name="external" size={17} />
                   </Button>
                 ) : (
@@ -1392,7 +1370,6 @@ function OrderPage({
         </div>
       </div>
       {error && <Notice tone="error">{error}</Notice>}
-      {order.test && <p className="test-note">Тестовый заказ.</p>}
       {!selected.can_install ? (
         <Notice>
           Платёж подтверждён, но установка пока недоступна. Обратитесь в
@@ -1525,7 +1502,7 @@ const questions = [
   ],
   [
     "Можно ли вернуться в свой аккаунт?",
-    "В нашем тесте Happ продолжил работать после возврата в собственный аккаунт App Store. Совместимость зависит от версии iOS и приложения. Обновление или повторная установка могут потребовать повторную авторизацию.",
+    "После успешного запуска можно вернуться в собственный аккаунт App Store. Совместимость зависит от версии iOS и приложения. Обновление или повторная установка могут потребовать повторную авторизацию.",
   ],
   [
     "Что делать, если приложение уже установлено?",
@@ -1533,7 +1510,7 @@ const questions = [
   ],
   [
     "Как устроена оплата и возврат?",
-    "Платёж обрабатывает ЮKassa. Доступ выдаётся после подтверждения сервером. В тестовом режиме реальные деньги не списываются. Если установка не удаётся или нужен возврат, обратитесь в поддержку с номером заказа.",
+    "Платёж обрабатывает ЮKassa. Доступ выдаётся после подтверждения сервером. Если установка не удаётся или нужен возврат, обратитесь в поддержку с номером заказа.",
   ],
 ];
 function Help() {
@@ -1570,15 +1547,13 @@ function Help() {
       <div className="terms">
         <h3>О сервисе</h3>
         <p>
-          Аппки — экспериментальный сервис доставки приложений. Совместимость
-          зависит от устройства, версии iOS и доступности авторизации Apple. Мы
-          не связаны с Apple или разработчиками приложений.
+          Аппки — сервис доставки приложений. Совместимость зависит от
+          устройства, версии iOS и доступности авторизации Apple. Мы не связаны
+          с Apple или разработчиками приложений.
         </p>
         <p>
           Не передавайте другим людям установочные ссылки и данные активации. Не
-          отправляйте поддержке пароли и коды личного аккаунта. Условия
-          коммерческой продажи и информация о продавце будут опубликованы до
-          запуска реальных платежей.
+          отправляйте поддержке пароли и коды личного аккаунта.
         </p>
       </div>
     </section>

@@ -671,13 +671,6 @@ summary:focus-visible {
   font-size: 12px;
   line-height: 1.6;
 }
-.test-note {
-  margin-top: 14px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.5;
-  text-align: center;
-}
 .page-heading {
   margin: 4px 0 24px;
 }
@@ -1026,34 +1019,6 @@ h1.page-heading {
 .status.refunded {
   color: #666;
   background: #e5e5e5;
-}
-.test-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 4px 6px;
-  border-radius: 6px;
-  color: #765710;
-  background: #fff2d4;
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1.3;
-  white-space: nowrap;
-}
-.test-badge > span {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: currentColor;
-}
-.order-test {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 9px;
-  margin: 16px 0;
-  color: var(--muted);
-  font-size: 11px;
 }
 .surface,
 .activation-panel {

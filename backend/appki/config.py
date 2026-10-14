@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     static_dir: Path = Path('web/dist')
     happ_ipa_path: Path = Path('/var/lib/appki/apps/Happ.ipa')
     happ_ipa_sha256: str = '94e9591fe92be4589c19344ab7089d0b6abe101cf9cfa7a80707d6c390a4a2f2'
-    happ_price_rub: str = '1.00'
+    happ_price_rub: str = '490.00'
     yookassa_shop_id: str = ''
     yookassa_secret_key: str = ''
     yookassa_mode: str = 'test'

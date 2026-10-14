@@ -37,9 +37,11 @@ async def test_network_failure_never_leaks_bot_token():
         assert error.value.__suppress_context__
 
 
-def test_purchases_and_test_mode_are_explicit():
+def test_bot_purchase_copy_is_shared_between_payment_modes():
     copy, markup = reply_for('/start@appki_test_bot', settings())
-    assert 'тестов' in copy
+    live = settings()
+    live.yookassa_mode = 'live'
+    assert reply_for('/start@appki_test_bot', live) == (copy, markup)
     assert markup['inline_keyboard'][0][0]['web_app']['url'] == 'https://example.com/'
 
 

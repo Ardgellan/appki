@@ -1,10 +1,13 @@
+import asyncio
 import base64
 import copy
 import json
+import socket
 
 import httpx
 import pytest
 
+import appki.payments as payments_module
 from appki.payments import (
     API_BASE,
     PaymentConfigurationError,
@@ -337,3 +340,211 @@ async def test_client_closes_owned_transport_only():
         assert not transport_client.is_closed
     finally:
         await transport_client.aclose()
+
+
+class RecordingTransport(httpx.AsyncBaseTransport):
+    def __init__(self, outcomes):
+        self.outcomes = iter(outcomes)
+        self.requests = []
+        self.closed = False
+
+    async def handle_async_request(self, request):
+        self.requests.append({
+            'url': request.url, 'method': request.method, 'headers': request.headers.copy(),
+            'body': await request.aread(), 'extensions': dict(request.extensions),
+        })
+        outcome = next(self.outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def aclose(self):
+        self.closed = True
+
+
+def patch_addresses(monkeypatch, addresses):
+    calls = []
+
+    async def resolve():
+        calls.append(True)
+        return addresses
+
+    monkeypatch.setattr(payments_module, '_resolve_yookassa_addresses', resolve)
+    return calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [httpx.ConnectError, httpx.ConnectTimeout])
+async def test_dns_fallback_preserves_payment_and_official_tls_identity(monkeypatch, failure):
+    dns_calls = patch_addresses(monkeypatch, ['8.8.8.8', '1.1.1.1'])
+    inner = RecordingTransport([failure('TCP/TLS unavailable'), httpx.Response(200)])
+    transport = payments_module._YooKassaTransport(inner)
+    body = b'{"amount":{"value":"490.00","currency":"RUB"}}'
+    request = httpx.Request(
+        'POST', API_BASE + '/payments?reference=a%20b', content=body,
+        headers={'Authorization': 'Basic test-auth', 'Idempotence-Key': 'same-order-key',
+                 'Content-Type': 'application/json'},
+        extensions={'timeout': {'connect': 5.0, 'read': 20.0}, 'marker': 'preserved'},
+    )
+    response = await transport.handle_async_request(request)
+    assert response.status_code == 200 and len(dns_calls) == 1
+    original, fallback = inner.requests
+    assert original['url'].host == 'api.yookassa.ru'
+    assert fallback['url'].host == '1.1.1.1' and fallback['url'].scheme == 'https'
+    assert fallback['url'].raw_path == request.url.raw_path
+    assert fallback['headers']['Host'] == 'api.yookassa.ru'
+    assert fallback['extensions']['sni_hostname'] == 'api.yookassa.ru'
+    assert fallback['extensions']['timeout'] == original['extensions']['timeout']
+    assert fallback['extensions']['marker'] == 'preserved'
+    assert fallback['method'] == original['method'] == 'POST'
+    assert fallback['headers'] == original['headers']
+    assert fallback['body'] == original['body'] == body
+    assert request.url.host == 'api.yookassa.ru' and 'sni_hostname' not in request.extensions
+    await transport.aclose()
+    assert inner.closed
+
+
+@pytest.mark.asyncio
+async def test_dns_fallback_routes_ipv6_with_original_hostname(monkeypatch):
+    patch_addresses(monkeypatch, ['8.8.8.8', '2606:4700:4700::1111'])
+    inner = RecordingTransport([httpx.ConnectTimeout('TLS unavailable'), httpx.Response(200)])
+    response = await payments_module._YooKassaTransport(inner).handle_async_request(
+        httpx.Request('GET', API_BASE + '/payments/' + PAYMENT_ID))
+    assert response.status_code == 200
+    routed = inner.requests[1]
+    assert routed['url'].host == '2606:4700:4700::1111'
+    assert routed['headers']['Host'] == routed['extensions']['sni_hostname'] == 'api.yookassa.ru'
+
+
+@pytest.mark.asyncio
+async def test_dns_fallback_all_connections_fail_without_leaking_or_changing_key(monkeypatch):
+    dns_calls = patch_addresses(monkeypatch, ['8.8.8.8', '1.1.1.1'])
+    inner = RecordingTransport([httpx.ConnectTimeout(SECRET), httpx.ConnectError(SECRET),
+                                httpx.ConnectTimeout(SECRET)])
+    async with httpx.AsyncClient(transport=payments_module._YooKassaTransport(inner)) as injected:
+        client = YooKassaClient(SHOP_ID, SECRET, client=injected)
+        with pytest.raises(PaymentProviderError) as error:
+            await client.create_payment(**CREATE_ARGS)
+    assert SECRET not in str(error.value) and error.value.__suppress_context__
+    assert len(inner.requests) == 3 and len(dns_calls) == 1
+    assert {request['headers']['Idempotence-Key'] for request in inner.requests} == {'purchase-123'}
+    assert len({request['body'] for request in inner.requests}) == 1
+    assert inner.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('url', ['https://other.example/v3/payments', 'http://api.yookassa.ru/v3/payments',
+                               'https://api.yookassa.ru:8443/v3/payments'])
+async def test_dns_fallback_never_applies_to_other_origins(monkeypatch, url):
+    dns_calls = patch_addresses(monkeypatch, ['8.8.8.8', '1.1.1.1'])
+    inner = RecordingTransport([httpx.ConnectTimeout('unavailable')])
+    with pytest.raises(httpx.ConnectTimeout):
+        await payments_module._YooKassaTransport(inner).handle_async_request(httpx.Request('GET', url))
+    assert len(inner.requests) == 1 and dns_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dns_fallback_does_not_retry_without_public_addresses(monkeypatch):
+    dns_calls = patch_addresses(monkeypatch, [])
+    inner = RecordingTransport([httpx.ConnectTimeout('unavailable')])
+    with pytest.raises(httpx.ConnectTimeout):
+        await payments_module._YooKassaTransport(inner).handle_async_request(httpx.Request('GET', API_BASE))
+    assert len(inner.requests) == 1 and len(dns_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_dns_fallback_can_recover_with_a_single_fresh_address(monkeypatch):
+    dns_calls = patch_addresses(monkeypatch, ['8.8.8.8'])
+    inner = RecordingTransport([httpx.ConnectTimeout('old DNS route failed'), httpx.Response(200)])
+    request = httpx.Request('POST', API_BASE + '/payments', content=b'unchanged-payment',
+                           headers={'Authorization': 'Basic test-auth', 'Idempotence-Key': 'same-key'})
+    response = await payments_module._YooKassaTransport(inner).handle_async_request(request)
+    assert response.status_code == 200 and len(dns_calls) == 1
+    original, direct = inner.requests
+    assert direct['url'].host == '8.8.8.8' and direct['url'].scheme == 'https'
+    assert direct['headers'] == original['headers']
+    assert direct['headers']['Host'] == direct['extensions']['sni_hostname'] == 'api.yookassa.ru'
+    assert direct['body'] == original['body'] == b'unchanged-payment'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [httpx.ReadTimeout, httpx.WriteError, httpx.WriteTimeout,
+                                   httpx.ReadError, httpx.PoolTimeout])
+async def test_dns_fallback_never_retries_uncertain_http_or_pool_failures(monkeypatch, failure):
+    dns_calls = patch_addresses(monkeypatch, ['8.8.8.8', '1.1.1.1'])
+    inner = RecordingTransport([failure('do not replay HTTP')])
+    with pytest.raises(failure):
+        await payments_module._YooKassaTransport(inner).handle_async_request(httpx.Request('POST', API_BASE))
+    assert len(inner.requests) == 1 and dns_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [200, 302, 400, 401, 403, 429, 500])
+async def test_dns_fallback_never_retries_an_http_response(monkeypatch, status):
+    dns_calls = patch_addresses(monkeypatch, ['8.8.8.8', '1.1.1.1'])
+    inner = RecordingTransport([httpx.Response(status)])
+    response = await payments_module._YooKassaTransport(inner).handle_async_request(
+        httpx.Request('POST', API_BASE))
+    assert response.status_code == status and len(inner.requests) == 1 and dns_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', [httpx.ReadTimeout('response unknown'),
+                                   httpx.WriteError('request may be sent'),
+                                   httpx.Response(400), httpx.Response(302)])
+async def test_dns_fallback_stops_after_an_alternate_reaches_http(monkeypatch, outcome):
+    patch_addresses(monkeypatch, ['8.8.8.8', '1.1.1.1', '9.9.9.9'])
+    inner = RecordingTransport([httpx.ConnectTimeout('first route failed'), outcome])
+    transport = payments_module._YooKassaTransport(inner)
+    request = httpx.Request('POST', API_BASE + '/payments', content=b'same-payment',
+                           headers={'Idempotence-Key': 'same-key'})
+    if isinstance(outcome, Exception):
+        with pytest.raises(type(outcome)):
+            await transport.handle_async_request(request)
+    else:
+        assert (await transport.handle_async_request(request)).status_code == outcome.status_code
+    assert [request['url'].host for request in inner.requests] == ['api.yookassa.ru', '1.1.1.1']
+
+
+@pytest.mark.asyncio
+async def test_dns_fallback_caps_alternate_connections(monkeypatch):
+    patch_addresses(monkeypatch, ['8.8.8.8', '1.1.1.1', '9.9.9.9', '8.8.4.4', '1.0.0.1'])
+    inner = RecordingTransport([httpx.ConnectTimeout('unavailable') for _ in range(4)])
+    with pytest.raises(httpx.ConnectTimeout):
+        await payments_module._YooKassaTransport(inner).handle_async_request(httpx.Request('GET', API_BASE))
+    assert [request['url'].host for request in inner.requests] == [
+        'api.yookassa.ru', '1.1.1.1', '9.9.9.9', '8.8.8.8']
+
+
+@pytest.mark.asyncio
+async def test_dns_resolution_is_official_bounded_and_filters_nonpublic_duplicates(monkeypatch):
+    calls = []
+
+    async def getaddrinfo(host, port, **kwargs):
+        calls.append((host, port, kwargs))
+        addresses = [(socket.AF_INET, '8.8.8.8'), (socket.AF_INET, '8.8.8.8'),
+                     (socket.AF_INET, '127.0.0.1'), (socket.AF_INET, '10.0.0.1'),
+                     (socket.AF_INET, '224.0.0.1'), (socket.AF_INET6, '::1'),
+                     (socket.AF_INET6, '::ffff:8.8.8.8'),
+                     (socket.AF_INET6, '2606:4700:4700::1111'),
+                     (socket.AF_INET6, '2606:4700:4700::1111'),
+                     (socket.AF_INET, 'not-an-address')]
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (address, port))
+                for family, address in addresses]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), 'getaddrinfo', getaddrinfo)
+    assert await payments_module._resolve_yookassa_addresses() == ['8.8.8.8', '2606:4700:4700::1111']
+    assert calls == [('api.yookassa.ru', 443, {'type': socket.SOCK_STREAM, 'proto': socket.IPPROTO_TCP})]
+
+
+@pytest.mark.asyncio
+async def test_dns_deadline_keeps_original_connection_failure_without_retry(monkeypatch):
+    async def getaddrinfo(*args, **kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(asyncio.get_running_loop(), 'getaddrinfo', getaddrinfo)
+    monkeypatch.setattr(payments_module, '_DNS_TIMEOUT_SECONDS', 0.001)
+    inner = RecordingTransport([httpx.ConnectTimeout('original TLS failure')])
+    with pytest.raises(httpx.ConnectTimeout, match='original TLS failure'):
+        await payments_module._YooKassaTransport(inner).handle_async_request(httpx.Request('GET', API_BASE))
+    assert len(inner.requests) == 1

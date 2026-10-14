@@ -84,6 +84,7 @@ def configured(tmp_path, monkeypatch):
         archive.writestr('Payload/Happ.app/Happ', b'synthetic-test-only-binary' * 100)
     cfg = Settings(_env_file=None, database_path=tmp_path / 'db.sqlite3', static_dir=tmp_path / 'dist',
                    happ_ipa_path=ipa_path, happ_ipa_sha256=hashlib.sha256(ipa_path.read_bytes()).hexdigest(),
+                   happ_price_rub='1.00',
                    bot_token=BOT_TOKEN, yookassa_shop_id='12345', yookassa_secret_key='test_local_fake_only',
                    public_base_url='https://example.test', support_url='https://t.me/example_support')
     fake = FakePayments()
@@ -815,6 +816,21 @@ def test_default_catalog_lists_seven_products_with_unpriced_planned_apps(configu
     with app.state.db.connection() as conn:
         assert conn.execute('SELECT COUNT(*) FROM apps').fetchone()[0] == 7
     assert fake.keys == [] and fake.gets == []
+
+
+def test_default_price_is_490_in_catalog_without_operator_env(configured, tmp_path):
+    fixture_cfg = configured[0]
+    # The fixture cleared settings environment variables; explicitly disable .env
+    # and omit the price override to exercise the deployment-independent default.
+    cfg = Settings(_env_file=None, database_path=tmp_path/'default-price.sqlite3',
+                   static_dir=tmp_path/'default-dist', happ_ipa_path=fixture_cfg.happ_ipa_path,
+                   happ_ipa_sha256=fixture_cfg.happ_ipa_sha256)
+    assert cfg.happ_price_rub == '490.00'
+    with TestClient(create_app(cfg)) as client:
+        items = client.get('/api/apps').json()['items']
+        happ = next(item for item in items if item['slug'] == 'happ')
+        assert happ['available'] and happ['price_rub'] == '490.00'
+        assert all(item['price_rub'] is None for item in items if item['coming_soon'])
 
 
 def test_planned_and_mixed_carts_fail_before_saving_orders_or_creating_payments(configured):
