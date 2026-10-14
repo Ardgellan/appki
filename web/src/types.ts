@@ -36,6 +36,9 @@ export interface Order {
   paid_at?: string;
   test: boolean;
   can_install: boolean;
+  has_payment: boolean;
+  can_retry_payment: boolean;
+  requires_payment_review: boolean;
   items?: OrderItem[];
   total_rub?: string;
 }

@@ -8,7 +8,7 @@ import secrets
 import time
 import uuid
 from urllib.parse import quote, urlsplit
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -207,10 +207,17 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
 
     def order_view(row):
         items = [item_view(item, row) for item in order_items(row['id'])]
+        unknown_pending = (row['status'] == 'pending' and not row['payment_id'] and
+                           bool(row['test']) == (cfg.yookassa_mode == 'test'))
+        within_retry_window = int(time.time()) - row['created_at'] < 23 * 3600
         return {'id': row['id'], 'app_slug': row['app_slug'], 'app_title': row['app_title'],
                 'amount_rub': row['amount_rub'], 'total_rub': row['amount_rub'], 'items': items,
                 'currency': row['currency'], 'status': row['status'],
-                'payment_url': row['payment_url'], 'created_at': iso(row['created_at']),
+                'payment_url': row['payment_url'] if row['status'] == 'pending' else None,
+                'has_payment': bool(row['payment_id']),
+                'can_retry_payment': unknown_pending and within_retry_window,
+                'requires_payment_review': unknown_pending and not within_retry_window,
+                'created_at': iso(row['created_at']),
                 'paid_at': iso(row['paid_at']), 'test': bool(row['test']),
                 'can_install': any(item['can_install'] for item in items)}
 
@@ -321,6 +328,26 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
     def me(user=Depends(current_user)):
         return {'user': user}
 
+    def overlapping_pending(conn, user_id, slugs):
+        placeholders = ','.join('?' for _ in slugs)
+        return [dict(row) for row in conn.execute(f'''SELECT DISTINCT o.* FROM orders o
+            JOIN order_items i ON i.order_id=o.id
+            WHERE o.user_id=? AND o.test=? AND o.status='pending' AND i.app_slug IN ({placeholders})
+            ORDER BY o.created_at,o.id''', (user_id, int(cfg.yookassa_mode == 'test'), *slugs)).fetchall()]
+
+    def same_cart(conn, order_id, slugs):
+        saved_slugs = [item['app_slug'] for item in conn.execute(
+            'SELECT app_slug FROM order_items WHERE order_id=? ORDER BY app_slug', (order_id,)).fetchall()]
+        return saved_slugs == slugs
+
+    async def refresh_payment(order):
+        try:
+            return await reconcile(order, force=True)
+        except (PaymentProviderError, PaymentConfigurationError):
+            raise HTTPException(503, 'Не удалось обновить статус оплаты. Повторите позже.')
+        except PaymentValidationError:
+            raise HTTPException(502, 'Не удалось проверить оплату. Обратитесь в поддержку.')
+
     @app.post('/api/orders')
     async def create_order(body: OrderBody, user=Depends(current_user)):
         if payment is None:
@@ -331,12 +358,40 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         total = format(sum((Decimal(item['price_rub']) for item in selected), Decimal('0')), '.2f')
         rate_limit(('orders', user['id']), 12)
         now = int(time.time())
+        with db.connection() as conn:
+            existing = conn.execute('SELECT id FROM orders WHERE user_id=? AND request_id=?',
+                                    (user['id'], body.request_id)).fetchone()
+            candidates = [] if existing else overlapping_pending(conn, user['id'], body.slugs)
+        # Provider I/O stays outside the write transaction. Do not start another purchase
+        # while an overlapping payment might already have completed.
+        for candidate in candidates:
+            if candidate['payment_id']:
+                await refresh_payment(candidate)
         with db.connection(write=True) as conn:
             row = conn.execute('SELECT * FROM orders WHERE user_id=? AND request_id=?',
                                (user['id'], body.request_id)).fetchone()
             if row is None:
                 if body.expected_amount_rub is not None and Decimal(body.expected_amount_rub) != Decimal(total):
                     raise HTTPException(409, 'Цена изменилась. Обновите корзину и подтвердите новую сумму.')
+                overlaps = overlapping_pending(conn, user['id'], body.slugs)
+                # A webhook can finish a previously observed draft while we await its
+                # provider lookup; inspect those same rows again under the write lock.
+                observed = [conn.execute('SELECT * FROM orders WHERE id=?', (item['id'],)).fetchone()
+                            for item in candidates]
+                completed = next((item for item in observed if item is not None and item['status'] == 'succeeded'
+                                  and same_cart(conn, item['id'], body.slugs)
+                                  and Decimal(item['amount_rub']) == Decimal(total)), None)
+                if completed is not None:
+                    row = completed
+                elif any(item is not None and item['status'] == 'succeeded' for item in observed):
+                    raise HTTPException(409, 'Оплата части приложений уже подтверждена. Проверьте покупки и обновите корзину перед новой оплатой.')
+                elif overlaps:
+                    matching = next((item for item in overlaps if same_cart(conn, item['id'], body.slugs)
+                                     and Decimal(item['amount_rub']) == Decimal(total)), None)
+                    if matching is None or len(overlaps) != 1:
+                        raise HTTPException(409, 'Есть незавершённая попытка оплаты этих приложений. Уточните её статус в поддержке перед новой оплатой.')
+                    row = matching
+            if row is None:
                 order_id = str(uuid.uuid4())
                 conn.execute('''INSERT INTO orders
                     (id,user_id,app_slug,app_title,amount_rub,request_id,created_at,test)
@@ -348,25 +403,46 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
                     [(order_id, item['slug'], item['title'], item['price_rub']) for item in selected])
                 row = conn.execute('SELECT * FROM orders WHERE id=?', (order_id,)).fetchone()
             else:
-                saved_slugs = [item['app_slug'] for item in conn.execute(
-                    'SELECT app_slug FROM order_items WHERE order_id=? ORDER BY app_slug', (row['id'],)).fetchall()]
-                if saved_slugs != body.slugs:
+                if not same_cart(conn, row['id'], body.slugs):
                     raise HTTPException(409, 'Этот идентификатор уже используется для другого заказа.')
                 if (body.expected_amount_rub is not None and
                         Decimal(body.expected_amount_rub) != Decimal(row['amount_rub'])):
                     raise HTTPException(409, 'Сумма этой попытки оплаты отличается. Откройте сохранённый заказ.')
             order = dict(row)
+        if (order['status'] == 'pending' and not order['payment_id'] and
+                bool(order['test']) == (cfg.yookassa_mode == 'test') and
+                int(time.time()) - order['created_at'] >= 23 * 3600):
+            return order_view(order)
         return await ensure_payment(order)
 
     async def ensure_payment(order):
         if payment is None:
             raise HTTPException(503, 'Приём оплаты ещё не настроен.')
-        if not all(catalog(item['app_slug'])['available'] for item in order_items(order['id'])):
-            raise HTTPException(503, 'Файл приложения временно недоступен. Оплата не создана.')
         if bool(order['test']) != (cfg.yookassa_mode == 'test'):
             raise HTTPException(409, 'Режим оплаты изменился. Создайте новый заказ.')
-        if order['status'] != 'pending' or order['payment_id']:
+        if order['status'] != 'pending':
             return order_view(order)
+        if order['payment_id']:
+            return order_view(await refresh_payment(order))
+        if not all(catalog(item['app_slug'])['available'] for item in order_items(order['id'])):
+            raise HTTPException(503, 'Файл приложения временно недоступен. Оплата не создана.')
+        with db.connection(write=True) as conn:
+            # Apply the overlap guard to every creation path, including an original
+            # request key and explicit recovery of a legacy draft.
+            latest = conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?',
+                                  (order['id'], order['user_id'])).fetchone()
+            if latest is None:
+                raise HTTPException(404, 'Заказ не найден.')
+            order = dict(latest)
+            if order['status'] == 'pending' and not order['payment_id']:
+                slugs = [item['app_slug'] for item in conn.execute(
+                    'SELECT app_slug FROM order_items WHERE order_id=?', (order['id'],)).fetchall()]
+                if any(item['id'] != order['id'] for item in overlapping_pending(conn, order['user_id'], slugs)):
+                    raise HTTPException(409, 'Есть другая незавершённая попытка оплаты этих приложений. Уточните её статус в поддержке перед новой оплатой.')
+        if order['status'] != 'pending':
+            return order_view(order)
+        if order['payment_id']:
+            return order_view(await refresh_payment(order))
         # YooKassa retains idempotence keys for 24h. Never risk a second charge after an uncertain old attempt.
         if int(time.time()) - order['created_at'] >= 23 * 3600:
             raise HTTPException(409, 'Статус старой попытки оплаты нужно уточнить в поддержке. Не оплачивайте повторно.')
@@ -388,10 +464,15 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         return await ensure_payment(row)
 
     @app.get('/api/orders')
-    def orders(user=Depends(current_user)):
+    def orders(status: Literal['pending', 'succeeded', 'canceled', 'refunded'] | None = None,
+               user=Depends(current_user)):
         with db.connection() as conn:
-            rows = conn.execute('SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 100',
-                                (user['id'],)).fetchall()
+            if status is None:
+                rows = conn.execute('SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 100',
+                                    (user['id'],)).fetchall()
+            else:
+                rows = conn.execute('SELECT * FROM orders WHERE user_id=? AND status=? ORDER BY created_at DESC LIMIT 100',
+                                    (user['id'], status)).fetchall()
         return {'items': [order_view(row) for row in rows]}
 
     @app.get('/api/orders/{order_id}')

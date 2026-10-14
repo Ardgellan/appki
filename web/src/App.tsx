@@ -8,6 +8,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import {
+  ApiError,
   api,
   authenticate,
   clearPurchaseRequest,
@@ -33,7 +34,6 @@ import type {
 } from "./types";
 import {
   fileSize,
-  formatDate,
   formatTime,
   httpsURL,
   orderStatus,
@@ -575,7 +575,13 @@ function CheckoutDialog({
         toast("Оплата подтверждена. Приложения доступны для установки.");
       } else {
         navigate(`/payment/${encodeURIComponent(order.id)}`);
-        if (order.payment_url) external(order.payment_url);
+        if (
+          order.status === "pending" &&
+          order.has_payment &&
+          !order.requires_payment_review &&
+          order.payment_url
+        )
+          external(order.payment_url);
       }
     } catch (cause) {
       setError(message(cause));
@@ -708,48 +714,11 @@ function Orders() {
     refreshOrders,
     config,
     navigate,
-    recordOrder,
   } = useApp();
   useEffect(() => {
     void refreshOrders();
   }, [refreshOrders]);
   const owned = purchasedApps(orders, config?.payments_mode ?? "test");
-  const pending = orders.filter(
-    (order) =>
-      order.status === "pending" &&
-      order.test === (config?.payments_mode === "test"),
-  );
-  const pendingIds = pending.map((order) => order.id).join(",");
-  useEffect(() => {
-    if (!user || !pendingIds) return;
-    let stopped = false;
-    let busy = false;
-    const reconcile = async () => {
-      if (busy || document.visibilityState !== "visible") return;
-      busy = true;
-      const results = await Promise.allSettled(
-        pendingIds
-          .split(",")
-          .slice(0, 3)
-          .map((id) => api<Order>(`/orders/${encodeURIComponent(id)}`)),
-      );
-      if (!stopped)
-        for (const result of results)
-          if (result.status === "fulfilled") recordOrder(result.value);
-      busy = false;
-    };
-    void reconcile();
-    const timer = window.setInterval(() => void reconcile(), 8000);
-    const focus = () => void reconcile();
-    document.addEventListener("visibilitychange", focus);
-    window.addEventListener("focus", focus);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-      document.removeEventListener("visibilitychange", focus);
-      window.removeEventListener("focus", focus);
-    };
-  }, [pendingIds, user, recordOrder]);
   return (
     <section>
       <div className="page-heading">
@@ -797,37 +766,7 @@ function Orders() {
           {!owned.length && !ordersError && (
             <div className="empty-state">
               <p>Здесь появятся приобретённые приложения.</p>
-              <Button onClick={() => navigate("/")}>
-                Выбрать приложения <Icon name="arrow" size={18} />
-              </Button>
             </div>
-          )}
-          {!!pending.length && (
-            <>
-              <h2 className="history-heading">Ожидают оплаты</h2>
-              <div className="orders-list">
-                {pending.map((order) => (
-                  <button
-                    type="button"
-                    className="order-row"
-                    key={order.id}
-                    onClick={() =>
-                      navigate(`/payment/${encodeURIComponent(order.id)}`)
-                    }
-                  >
-                    <Icon name="bank" size={22} />
-                    <div className="order-row-info">
-                      <strong>{appCount(orderItems(order).length)}</strong>
-                      <span>
-                        {rubles(order.amount_rub)} ·{" "}
-                        {formatDate(order.created_at)}
-                      </span>
-                    </div>
-                    <Icon name="chevronRight" size={18} />
-                  </button>
-                ))}
-              </div>
-            </>
           )}
         </>
       )}
@@ -999,7 +938,7 @@ function OrderPage({
   paymentReturn?: boolean;
   paymentPage?: boolean;
 }) {
-  const { user, authReady, recordOrder, navigate, toast } = useApp();
+  const { config, user, authReady, recordOrder, navigate, toast } = useApp();
   const [order, setOrder] = useState<Order | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -1049,7 +988,7 @@ function OrderPage({
     void load();
   }, [load]);
   useEffect(() => {
-    if (order?.status !== "pending") return;
+    if (order?.status !== "pending" || !order.has_payment) return;
     const refresh = () => {
       if (document.visibilityState === "visible") void load(true);
     };
@@ -1061,9 +1000,17 @@ function OrderPage({
       document.removeEventListener("visibilitychange", refresh);
       window.removeEventListener("focus", refresh);
     };
-  }, [order?.status, load]);
+  }, [order?.status, order?.has_payment, load]);
   async function retryPayment() {
-    if (!order || checking) return;
+    if (
+      !order ||
+      order.status !== "pending" ||
+      (!order.has_payment && !order.can_retry_payment) ||
+      order.requires_payment_review ||
+      loadingPayment.current
+    )
+      return;
+    loadingPayment.current = true;
     setChecking(true);
     setError("");
     try {
@@ -1073,11 +1020,36 @@ function OrderPage({
       );
       setOrder(next);
       recordOrder(next);
-      if (next.payment_url) external(next.payment_url);
+      if (next.status === "succeeded") {
+        navigate("/orders");
+        toast("Оплата подтверждена. Можно устанавливать приложения.");
+      } else if (
+        next.status === "pending" &&
+        next.has_payment &&
+        !next.requires_payment_review &&
+        next.payment_url
+      )
+        external(next.payment_url);
     } catch (cause) {
       setError(message(cause));
+      if (cause instanceof ApiError && cause.status === 409) {
+        try {
+          const fresh = await api<Order>(
+            `/orders/${encodeURIComponent(order.id)}`,
+          );
+          setOrder(fresh);
+          recordOrder(fresh);
+          if (fresh.status === "succeeded") {
+            navigate("/orders");
+            toast("Оплата подтверждена. Можно устанавливать приложения.");
+          }
+        } catch {
+          /* Keep the original retry error if the status refresh also fails. */
+        }
+      }
     } finally {
       setChecking(false);
+      loadingPayment.current = false;
     }
   }
   const items = order ? orderItems(order) : [];
@@ -1149,16 +1121,25 @@ function OrderPage({
       toast("Не удалось скопировать. Нажмите «Открыть установку».");
     }
   }
+  const paymentScreen =
+    paymentPage ||
+    paymentReturn ||
+    (order !== null && order.status !== "succeeded");
   if (!authReady || (user && loading))
     return (
       <>
-        <Back label="Мои приложения" to="/orders" />
+        {paymentScreen ? (
+          <Back />
+        ) : (
+          <Back label="Мои приложения" to="/orders" />
+        )}
         <Skeleton />
       </>
     );
   if (!user)
     return (
       <section>
+        {paymentScreen && <Back />}
         <div className="page-heading">
           <h1>{paymentReturn ? "Проверим оплату в Telegram" : "Ваш заказ"}</h1>
           <p>
@@ -1173,7 +1154,11 @@ function OrderPage({
   if (!order)
     return (
       <>
-        <Back label="Мои приложения" to="/orders" />
+        {paymentScreen ? (
+          <Back />
+        ) : (
+          <Back label="Мои приложения" to="/orders" />
+        )}
         <Notice tone="error">{error || "Заказ не найден."}</Notice>
         <Button secondary busy={checking} onClick={() => void load()}>
           Проверить ещё раз
@@ -1181,10 +1166,11 @@ function OrderPage({
       </>
     );
   const paymentURL = httpsURL(order.payment_url);
+  const support = supportURL(config?.support_url);
   if (order.status !== "succeeded")
     return (
       <section>
-        <Back label="Мои приложения" to="/orders" />
+        <Back />
         <div className="payment-method">
           <Icon name="bank" size={19} />
           <span>
@@ -1211,57 +1197,93 @@ function OrderPage({
         {order.status === "pending" ? (
           <div className="surface payment-panel">
             <h2>
-              {paymentReturn
-                ? "Проверяем результат оплаты"
-                : order.test
-                  ? "Оплата на тестовой странице"
-                  : "Оплатите в приложении банка"}
+              {order.requires_payment_review
+                ? "Нужно уточнить статус оплаты"
+                : order.has_payment && paymentReturn
+                  ? "Проверяем результат оплаты"
+                  : order.has_payment && order.test
+                    ? "Оплата на тестовой странице"
+                    : order.has_payment
+                      ? "Оплатите в приложении банка"
+                      : "Создание платежа"}
             </h2>
-            <p>
-              {order.test
-                ? "Платёж откроется на тестовой странице ЮKassa."
-                : "Подтвердите платёж через СБП."}{" "}
-              После подтверждения сервером приложения появятся в «Моих
-              приложениях».
-            </p>
-            {paymentURL ? (
-              <a
-                className="button full"
-                href={paymentURL}
-                target="_blank"
-                rel="noreferrer"
-                onClick={(event) => {
-                  if (window.Telegram?.WebApp?.initData) {
-                    event.preventDefault();
-                    external(paymentURL);
-                  }
-                }}
-              >
-                Открыть {order.test ? "тестовую оплату" : "оплату через СБП"}
-                <Icon name="external" size={17} />
-              </a>
-            ) : (
+            {order.requires_payment_review ? (
+              <>
+                <p>
+                  Сервер не получил подтверждение создания платежа. С момента
+                  попытки прошло больше 23 часов — сначала нужно уточнить её
+                  результат в поддержке. Не оплачивайте этот заказ повторно до
+                  проверки.
+                </p>
+                {support ? (
+                  <a
+                    className="button full"
+                    href={support}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Написать в поддержку <Icon name="external" size={17} />
+                  </a>
+                ) : (
+                  <Notice>
+                    Канал поддержки ещё настраивается. Сохраните номер заказа
+                    для проверки старой попытки оплаты.
+                  </Notice>
+                )}
+              </>
+            ) : order.has_payment ? (
+              <>
+                <p>
+                  {order.test
+                    ? "Платёж откроется на тестовой странице ЮKassa."
+                    : "Подтвердите платёж через СБП."}{" "}
+                  После подтверждения сервером приложения появятся в «Моих
+                  приложениях».
+                </p>
+                {paymentURL ? (
+                  <Button
+                    className="full"
+                    busy={checking}
+                    onClick={retryPayment}
+                  >
+                    Открыть{" "}
+                    {order.test ? "тестовую оплату" : "оплату через СБП"}
+                    <Icon name="external" size={17} />
+                  </Button>
+                ) : (
+                  <Notice>
+                    Платёж создан, но ссылка на оплату пока недоступна.
+                    Проверьте его статус позже.
+                  </Notice>
+                )}
+                <Button
+                  className="full"
+                  secondary
+                  busy={checking}
+                  onClick={() => void load()}
+                >
+                  Проверить оплату <Icon name="refresh" size={17} />
+                </Button>
+                <p className="small-text muted">
+                  Статус проверяется автоматически.
+                </p>
+              </>
+            ) : order.can_retry_payment ? (
               <>
                 <Notice>
-                  Создание платежа не завершилось. Повторим запрос для того же
-                  заказа.
+                  Создание платежа пока не подтверждено. Повторим ту же попытку
+                  для этого заказа, сохранив её идентификатор.
                 </Notice>
                 <Button className="full" busy={checking} onClick={retryPayment}>
                   Повторить создание оплаты
                 </Button>
               </>
+            ) : (
+              <Notice>
+                Создание платежа сейчас недоступно. Обратитесь в поддержку с
+                номером заказа.
+              </Notice>
             )}
-            <Button
-              className="full"
-              secondary
-              busy={checking}
-              onClick={() => void load()}
-            >
-              Проверить оплату <Icon name="refresh" size={17} />
-            </Button>
-            <p className="small-text muted">
-              Статус проверяется автоматически.
-            </p>
           </div>
         ) : (
           <div className="surface">
@@ -1603,6 +1625,8 @@ export default function App() {
   const lastPath = useRef(path);
   const userRef = useRef<User | null>(null);
   const orderWrites = useRef(0);
+  const orderWriteVersions = useRef(new Map<string, number>());
+  const ordersRequest = useRef(0);
   userRef.current = user;
   const navigate = useCallback((route: string) => {
     if (window.location.pathname + window.location.search !== route)
@@ -1622,11 +1646,15 @@ export default function App() {
   const recordOrder = useCallback(
     (order: Order) => {
       orderWrites.current++;
-      setOrders((previous) =>
-        [order, ...previous.filter((item) => item.id !== order.id)].sort(
+      orderWriteVersions.current.set(order.id, orderWrites.current);
+      setOrders((previous) => {
+        const cached = previous.find((item) => item.id === order.id);
+        if (order.status === "pending" && cached && cached.status !== "pending")
+          return previous;
+        return [order, ...previous.filter((item) => item.id !== order.id)].sort(
           (a, b) => b.created_at.localeCompare(a.created_at),
-        ),
-      );
+        );
+      });
       if (order.status !== "pending")
         clearPurchaseRequest(
           cartRequestKey(
@@ -1645,18 +1673,59 @@ export default function App() {
     if (!user) return;
     const owner = user.id;
     const version = orderWrites.current;
+    const request = ++ordersRequest.current;
     setOrdersLoading(true);
     setOrdersError("");
     try {
-      const result = await api<{ items: Order[] }>("/orders");
-      if (userRef.current?.id === owner) {
-        if (orderWrites.current === version) setOrders(result.items);
-        setOrdersReady(true);
+      const results = await Promise.allSettled([
+        api<{ items: Order[] }>("/orders?status=succeeded"),
+        api<{ items: Order[] }>("/orders?status=pending"),
+      ]);
+      if (userRef.current?.id !== owner || ordersRequest.current !== request)
+        return;
+      const fetchedStatuses = new Set<Order["status"]>();
+      const incoming: Order[] = [];
+      for (const [index, result] of results.entries()) {
+        if (result.status !== "fulfilled") continue;
+        fetchedStatuses.add(index === 0 ? "succeeded" : "pending");
+        incoming.push(...result.value.items);
       }
-    } catch (cause) {
-      if (userRef.current?.id === owner) setOrdersError(message(cause));
+      setOrders((previous) => {
+        const merged = new Map<string, Order>();
+        const cached = new Map(previous.map((order) => [order.id, order]));
+        const incomingIds = new Set(incoming.map((order) => order.id));
+        for (const order of previous) {
+          if (
+            !fetchedStatuses.has(order.status) ||
+            (orderWriteVersions.current.get(order.id) ?? 0) > version ||
+            (order.status === "pending" &&
+              order.has_payment &&
+              !incomingIds.has(order.id))
+          )
+            merged.set(order.id, order);
+        }
+        for (const order of incoming) {
+          if ((orderWriteVersions.current.get(order.id) ?? 0) > version)
+            continue;
+          if (
+            order.status === "pending" &&
+            ((cached.has(order.id) &&
+              cached.get(order.id)?.status !== "pending") ||
+              merged.get(order.id)?.status === "succeeded")
+          )
+            continue;
+          merged.set(order.id, order);
+        }
+        return [...merged.values()].sort((a, b) =>
+          b.created_at.localeCompare(a.created_at),
+        );
+      });
+      const paid = results[0];
+      if (paid.status === "fulfilled") setOrdersReady(true);
+      else setOrdersError(message(paid.reason));
     } finally {
-      if (userRef.current?.id === owner) setOrdersLoading(false);
+      if (userRef.current?.id === owner && ordersRequest.current === request)
+        setOrdersLoading(false);
     }
   }, [user]);
   const load = useCallback(async () => {
@@ -1765,8 +1834,63 @@ export default function App() {
   useEffect(() => {
     setOrders([]);
     setOrdersReady(false);
+    orderWriteVersions.current.clear();
     void refreshOrders();
   }, [refreshOrders]);
+  const pendingPaymentIds = orders
+    .filter(
+      (order) =>
+        order.status === "pending" &&
+        order.has_payment &&
+        !order.requires_payment_review &&
+        order.test === (config?.payments_mode === "test"),
+    )
+    .map((order) => order.id)
+    .sort()
+    .join(",");
+  useEffect(() => {
+    if (!user || !pendingPaymentIds) return;
+    const owner = user.id;
+    const ids = pendingPaymentIds.split(",");
+    let stopped = false;
+    let busy = false;
+    let cursor = 0;
+    const reconcile = async () => {
+      if (busy || document.visibilityState !== "visible") return;
+      busy = true;
+      const batch = ids.slice(cursor, cursor + 3);
+      cursor = cursor + 3 >= ids.length ? 0 : cursor + 3;
+      const versions = new Map(
+        batch.map((id) => [id, orderWriteVersions.current.get(id) ?? 0]),
+      );
+      try {
+        const results = await Promise.allSettled(
+          batch.map((id) => api<Order>(`/orders/${encodeURIComponent(id)}`)),
+        );
+        if (!stopped && userRef.current?.id === owner)
+          for (const result of results)
+            if (
+              result.status === "fulfilled" &&
+              (orderWriteVersions.current.get(result.value.id) ?? 0) ===
+                versions.get(result.value.id)
+            )
+              recordOrder(result.value);
+      } finally {
+        busy = false;
+      }
+    };
+    void reconcile();
+    const timer = window.setInterval(() => void reconcile(), 8000);
+    const focus = () => void reconcile();
+    document.addEventListener("visibilitychange", focus);
+    window.addEventListener("focus", focus);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", focus);
+      window.removeEventListener("focus", focus);
+    };
+  }, [pendingPaymentIds, user, recordOrder]);
   useEffect(() => {
     if (!authReady || loading) return;
     cartStorageKey.current = `appki.cart.v1.${user?.id ?? "public"}`;

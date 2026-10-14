@@ -39,6 +39,7 @@ class FakePayments:
         self.keys = []
         self.gets = []
         self.fail_create = False
+        self.fail_after_create = False
         self.fail_get = False
         self.closed = False
 
@@ -55,6 +56,8 @@ class FakePayments:
                  'metadata': {'order_id': kwargs['order_id']}, 'recipient': {'account_id': '12345'},
                  'confirmation': {'type': 'redirect', 'confirmation_url': 'https://yoomoney.ru/checkout/test'}}
         self.values[payment_id] = value
+        if self.fail_after_create:
+            raise PaymentProviderError('timeout after provider persisted payment')
         return copy.deepcopy(value)
 
     async def get_payment(self, payment_id):
@@ -189,13 +192,19 @@ def test_timeout_retry_keeps_idempotence_key_and_stops_after_window(configured):
     fake.fail_create = False
     assert client.post('/api/orders', headers=headers, json=payload).status_code == 200
     assert fake.keys[0] == fake.keys[1]
+    payment_id = next(iter(fake.values))
+    fake.values[payment_id].update(status='canceled', paid=False)
+    result = client.get('/api/orders', headers=headers).json()['items'][0]
+    assert client.post(f"/api/orders/{result['id']}/retry-payment", headers=headers).json()['status'] == 'canceled'
     fake.fail_create = True
     payload['request_id'] = 'old-request'
     assert client.post('/api/orders', headers=headers, json=payload).status_code == 503
     with app.state.db.connection(write=True) as conn:
         conn.execute('UPDATE orders SET created_at=0 WHERE request_id=?', ('old-request',))
     calls = len(fake.keys)
-    assert client.post('/api/orders', headers=headers, json=payload).status_code == 409
+    review = client.post('/api/orders', headers=headers, json=payload)
+    assert review.status_code == 200 and review.json()['requires_payment_review']
+    assert client.post(f"/api/orders/{review.json()['id']}/retry-payment", headers=headers).status_code == 409
     assert len(fake.keys) == calls
 
 
@@ -439,6 +448,9 @@ def test_cart_price_confirmation_prevents_new_checkout_and_preserves_retry_snaps
     payload['request_id'] = 'new-priced-cart'
     assert client.post('/api/orders', headers=headers, json=payload).status_code == 409
     payload['expected_amount_rub'] = '2.00'
+    assert client.post('/api/orders', headers=headers, json=payload).status_code == 409
+    payment_id = next(iter(fake.values))
+    fake.values[payment_id].update(status='canceled', paid=False)
     result = client.post('/api/orders', headers=headers, json=payload).json()
     assert result['amount_rub'] == result['items'][0]['amount_rub'] == '2.00'
     assert len(set(fake.keys)) == 2
@@ -618,3 +630,169 @@ def test_ipa_metadata_uses_pinned_bundle_and_safely_escaped_title(tmp_path):
     assert f'<h1>{html.escape(title)}</h1>' in page
     assert f'<title>Установить {html.escape(title)}</title>' in page
     assert f'>Установить {html.escape(title)}</a>' in page
+
+
+@pytest.mark.parametrize('recovery', ['same_key_retry', 'metadata_webhook'])
+def test_timeout_after_remote_creation_recovers_the_original_payment(configured, recovery):
+    cfg, fake, app, client = configured
+    headers = login(client)
+    payload = {'app_slugs': ['happ'], 'request_id': 'remote-created-timeout', 'expected_amount_rub': '1.00'}
+    fake.fail_after_create = True
+    assert client.post('/api/orders', headers=headers, json=payload).status_code == 503
+    draft = client.get('/api/orders', headers=headers).json()['items'][0]
+    assert not draft['has_payment'] and draft['can_retry_payment'] and not draft['requires_payment_review']
+    assert len(fake.values) == 1
+    payment_id = next(iter(fake.values))
+    if recovery == 'same_key_retry':
+        recovered = client.post('/api/orders', headers=headers, json=payload)
+        assert recovered.status_code == 200
+        result = recovered.json()
+        assert result['has_payment'] and not result['can_retry_payment'] and result['payment_url']
+    else:
+        fake.values[payment_id].update(status='succeeded', paid=True)
+        event = {'event': 'payment.succeeded', 'object': {'id': payment_id, 'metadata': {'order_id': draft['id']}}}
+        assert client.post('/api/payments/yookassa/webhook', json=event).status_code == 200
+        result = client.get(f"/api/orders/{draft['id']}", headers=headers).json()
+        assert result['status'] == 'succeeded' and result['has_payment'] and result['payment_url'] is None
+    assert result['id'] == draft['id'] and len(fake.values) == 1 and len(set(fake.keys)) == 1
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0] == 1
+
+
+def test_aged_unknown_checkout_cannot_be_bypassed_with_a_new_key(configured):
+    cfg, fake, app, client = configured
+    headers = login(client)
+    payload = {'app_slugs': ['happ'], 'request_id': 'aged-unknown', 'expected_amount_rub': '1.00'}
+    fake.fail_create = True
+    assert client.post('/api/orders', headers=headers, json=payload).status_code == 503
+    draft = client.get('/api/orders', headers=headers).json()['items'][0]
+    with app.state.db.connection(write=True) as conn:
+        conn.execute('UPDATE orders SET created_at=? WHERE id=?', (int(time.time())-209*3600, draft['id']))
+    calls = len(fake.keys)
+    for request_id in ['aged-unknown', 'replacement-new-key']:
+        response = client.post('/api/orders', headers=headers, json={**payload, 'request_id': request_id})
+        assert response.status_code == 200
+        review = response.json()
+        assert review['id'] == draft['id'] and review['requires_payment_review']
+        assert not review['has_payment'] and not review['can_retry_payment'] and review['payment_url'] is None
+    assert client.post(f"/api/orders/{draft['id']}/retry-payment", headers=headers).status_code == 409
+    cfg.happ_price_rub = '2.00'
+    changed = {**payload, 'request_id': 'different-price-key', 'expected_amount_rub': '2.00'}
+    assert client.post('/api/orders', headers=headers, json=changed).status_code == 409
+    assert len(fake.keys) == calls
+    cfg.yookassa_mode = 'live'
+    other_mode = client.get(f"/api/orders/{draft['id']}", headers=headers).json()
+    assert not other_mode['can_retry_payment'] and not other_mode['requires_payment_review']
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0] == 1
+
+
+def test_known_payment_retry_reconciles_and_hides_canceled_url(configured):
+    cfg, fake, app, client = configured
+    headers = login(client)
+    original = order(client, headers)
+    payment_id = next(iter(fake.values))
+    assert original['has_payment'] and not original['can_retry_payment'] and original['payment_url']
+    fake.fail_get = True
+    path = f"/api/orders/{original['id']}/retry-payment"
+    assert client.post(path, headers=headers).status_code == 503
+    assert len(fake.keys) == 1
+    fake.fail_get = False
+    fake.values[payment_id].update(status='canceled', paid=False)
+    canceled = client.post(path, headers=headers).json()
+    assert canceled['status'] == 'canceled' and canceled['payment_url'] is None
+    assert canceled['has_payment'] and not canceled['can_retry_payment'] and not canceled['requires_payment_review']
+    assert order(client, headers)['payment_url'] is None
+    assert len(fake.keys) == 1
+    replacement = order(client, headers, 'confirmed-canceled-replacement')
+    assert replacement['id'] != original['id'] and replacement['payment_url'] and len(fake.keys) == 2
+
+
+@pytest.mark.parametrize('completed_cart', ['same_cart', 'partial_overlap', 'new_price'])
+def test_new_key_reconciles_a_just_paid_draft_before_starting_checkout(configured, completed_cart):
+    cfg, fake, app, client = configured
+    headers = login(client)
+    original = order(client, headers)
+    payment_id = next(iter(fake.values))
+    expected = '1.00'
+    if completed_cart == 'partial_overlap':
+        with app.state.db.connection(write=True) as conn:
+            conn.execute('INSERT INTO order_items (order_id,app_slug,app_title,amount_rub) VALUES (?,?,?,?)',
+                         (original['id'], 'historical-app', 'Historical fixture', '2.00'))
+            conn.execute('UPDATE orders SET amount_rub=? WHERE id=?', ('3.00', original['id']))
+        fake.values[payment_id]['amount']['value'] = '3.00'
+    elif completed_cart == 'new_price':
+        cfg.happ_price_rub = expected = '2.00'
+    fake.values[payment_id].update(status='succeeded', paid=True)
+    response = client.post('/api/orders', headers=headers, json={
+        'app_slugs': ['happ'], 'request_id': 'new-key-after-confirmation', 'expected_amount_rub': expected})
+    if completed_cart == 'same_cart':
+        assert response.status_code == 200 and response.json()['id'] == original['id']
+        assert response.json()['status'] == 'succeeded' and response.json()['payment_url'] is None
+    else:
+        assert response.status_code == 409
+    assert len(fake.keys) == 1 and len(fake.gets) == 1
+    assert client.get(f"/api/orders/{original['id']}", headers=headers).json()['status'] == 'succeeded'
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0] == 1
+
+
+def test_concurrent_new_checkout_keys_reuse_one_pending_order(configured):
+    from concurrent.futures import ThreadPoolExecutor
+    cfg, fake, app, client = configured
+    headers = login(client)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda index: order(client, headers, f'concurrent-new-key-{index}'), range(4)))
+    assert len({result['id'] for result in results}) == 1
+    assert len(set(fake.keys)) == 1 and len(fake.values) == 1
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0] == 1
+
+
+def test_multiple_legacy_overlaps_require_review_instead_of_another_payment(configured):
+    cfg, fake, app, client = configured
+    headers = login(client)
+    fake.fail_create = True
+    assert client.post('/api/orders', headers=headers,
+                       json={'app_slug': 'happ', 'request_id': 'first-legacy-draft'}).status_code == 503
+    original = client.get('/api/orders', headers=headers).json()['items'][0]
+    legacy_id = str(uuid.uuid4())
+    with app.state.db.connection(write=True) as conn:
+        conn.execute('''INSERT INTO orders (id,user_id,app_slug,app_title,amount_rub,request_id,created_at,test)
+            VALUES (?,111,'happ','Legacy overlapping cart','3.00','second-legacy-draft',?,1)''',
+                     (legacy_id, int(time.time())-209*3600))
+        conn.executemany('INSERT INTO order_items (order_id,app_slug,app_title,amount_rub) VALUES (?,?,?,?)',
+                         [(legacy_id, 'happ', 'Happ', '1.00'),
+                          (legacy_id, 'historical-app', 'Historical fixture', '2.00')])
+    calls = len(fake.keys)
+    fake.fail_create = False
+    response = client.post('/api/orders', headers=headers, json={
+        'app_slugs': ['happ'], 'request_id': 'third-overlap-key', 'expected_amount_rub': '1.00'})
+    assert response.status_code == 409 and len(fake.keys) == calls
+    assert client.post('/api/orders', headers=headers, json={
+        'app_slugs': ['happ'], 'request_id': 'first-legacy-draft', 'expected_amount_rub': '1.00'}).status_code == 409
+    assert client.post(f"/api/orders/{original['id']}/retry-payment", headers=headers).status_code == 409
+    assert len(fake.keys) == calls
+    assert client.get(f"/api/orders/{original['id']}", headers=headers).json()['status'] == 'pending'
+
+
+def test_paid_order_filter_is_validated_and_not_displaced_by_hidden_drafts(configured):
+    cfg, fake, app, client = configured
+    headers, purchased, _ = paid(configured)
+    outsider = login(client, 222)
+    with app.state.db.connection(write=True) as conn:
+        for index in range(101):
+            draft_id = str(uuid.uuid4())
+            conn.execute('''INSERT INTO orders (id,user_id,app_slug,app_title,amount_rub,request_id,created_at,test)
+                VALUES (?,111,'happ','Happ','1.00',?,?,1)''',
+                         (draft_id, f'hidden-draft-{index}', int(time.time())+index+1))
+            conn.execute('INSERT INTO order_items (order_id,app_slug,app_title,amount_rub) VALUES (?,?,?,?)',
+                         (draft_id, 'happ', 'Happ', '1.00'))
+    unfiltered = client.get('/api/orders', headers=headers).json()['items']
+    assert len(unfiltered) == 100 and all(item['id'] != purchased['id'] for item in unfiltered)
+    filtered = client.get('/api/orders?status=succeeded', headers=headers).json()['items']
+    assert [item['id'] for item in filtered] == [purchased['id']]
+    assert len(client.get('/api/orders?status=pending', headers=headers).json()['items']) == 100
+    assert client.get('/api/orders?status=canceled', headers=headers).json()['items'] == []
+    assert client.get('/api/orders?status=succeeded', headers=outsider).json()['items'] == []
+    assert client.get('/api/orders?status=unknown', headers=headers).status_code == 422
