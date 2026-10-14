@@ -1,10 +1,13 @@
+import base64
 import copy
 import hashlib
 import html
 import hmac
 import json
 import plistlib
+import shutil
 import sqlite3
+import subprocess
 import time
 import uuid
 from urllib.parse import urlencode, urlsplit
@@ -17,7 +20,7 @@ from appki.auth import InvalidTelegramData, token_hash, validate_init_data
 from appki.config import Settings
 from appki.db import Database
 from appki.main import create_app
-from appki.ota import IPAFile
+from appki.ota import INSTALL_SCRIPT, IPAFile
 from appki.payments import PaymentProviderError
 
 BOT_TOKEN = '123456:local-test-only-token'
@@ -629,10 +632,80 @@ def test_ipa_metadata_uses_pinned_bundle_and_safely_escaped_title(tmp_path):
     assert metadata['bundle-identifier'] == bundle_id and metadata['title'] == title
     assert b'<script>' not in manifest
     page = app_file.page('https://example.test', 'a'*64)
-    assert title not in page and '<script>' not in page
+    assert title not in page and page.count('<script>') == page.count('</script>') == 1
+    assert page.split('<script>')[1].split('</script>')[0] == INSTALL_SCRIPT
     assert f'<h1>{html.escape(title)}</h1>' in page
     assert f'<title>Установить {html.escape(title)}</title>' in page
     assert f'>Установить {html.escape(title)}</a>' in page
+
+
+def test_install_landing_authorizes_only_its_static_script_and_preserves_download_headers(configured):
+    cfg, fake, app, client = configured
+    _, _, _, path = grant(configured)
+    page = client.get(path)
+    assert page.text.count('<script>') == page.text.count('</script>') == 1
+    script = page.text.split('<script>')[1].split('</script>')[0]
+    digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+    policy = page.headers['content-security-policy']
+    script_directive = next(part.strip() for part in policy.split(';') if part.strip().startswith('script-src '))
+    assert script_directive == f"script-src 'sha256-{digest}'"
+    assert "default-src 'none'" in policy and "frame-ancestors 'none'" in policy
+    assert "base-uri 'none'" in policy
+    assert 'id="install-app" href="itms-services://' in page.text
+    assert path.rsplit('/', 1)[-1] not in script and cfg.public_base_url not in script
+    head = client.head(path)
+    assert head.status_code == 200 and head.content == b''
+    assert head.headers['content-security-policy'] == policy
+    assert int(head.headers['content-length']) == len(page.content)
+    for suffix in ['/manifest.plist', '/app.ipa']:
+        response = client.get(path+suffix)
+        assert 'script-src' not in response.headers['content-security-policy']
+        assert 'no-store' in response.headers['cache-control']
+        assert response.headers['referrer-policy'] == 'no-referrer'
+
+
+def test_install_landing_script_attempts_once_only_on_ios_and_keeps_fallback(configured):
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node is optional for backend-only environments; required for the frontend project.')
+    _, _, _, client = configured
+    _, _, _, path = grant(configured)
+    page = client.get(path)
+    script = page.text.split('<script>')[1].split('</script>')[0]
+    scenarios = [
+        {'userAgent': 'iPhone', 'platform': 'iPhone', 'maxTouchPoints': 5},
+        {'userAgent': 'iPad', 'platform': 'iPad', 'maxTouchPoints': 5},
+        {'userAgent': 'Macintosh', 'platform': 'MacIntel', 'maxTouchPoints': 5},
+        {'userAgent': 'Macintosh', 'platform': 'MacIntel', 'maxTouchPoints': 0},
+        {'userAgent': 'Android', 'platform': 'Linux', 'maxTouchPoints': 5},
+        {'userAgent': 'Windows', 'platform': 'Win32', 'maxTouchPoints': 0},
+        {'userAgent': 'iPhone', 'platform': 'iPhone', 'maxTouchPoints': 5, 'blocked': True},
+        {'userAgent': 'iPhone', 'platform': 'iPhone', 'maxTouchPoints': 5, 'missingButton': True},
+    ]
+    runner = '''
+const vm = require('node:vm');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const output = input.scenarios.map(scenario => {
+  const calls = [], lookups = [];
+  const button = { href: 'itms-services://?action=download-manifest&url=expected' };
+  const context = {
+    navigator: scenario,
+    document: { getElementById(id) { lookups.push(id); return scenario.missingButton ? null : button; } },
+    window: { location: { assign(href) { calls.push(href); if (scenario.blocked) throw new Error('blocked'); } } }
+  };
+  vm.runInNewContext(input.script, context, { timeout: 1000 });
+  return { calls, lookups, href: button.href };
+});
+process.stdout.write(JSON.stringify(output));
+'''
+    result = subprocess.run([node, '-e', runner], input=json.dumps({'script': script, 'scenarios': scenarios}),
+                            text=True, capture_output=True, check=True, timeout=10)
+    outcomes = json.loads(result.stdout)
+    for index, outcome in enumerate(outcomes):
+        assert len(outcome['calls']) == (1 if index in (0, 1, 2, 6) else 0)
+        assert outcome['lookups'] == (['install-app'] if index in (0, 1, 2, 6, 7) else [])
+        assert all(href == outcome['href'] for href in outcome['calls'])
+    assert 'id="install-app" href="itms-services://' in page.text
 
 
 @pytest.mark.parametrize('recovery', ['same_key_retry', 'metadata_webhook'])

@@ -470,10 +470,9 @@ function InstallationInstructions() {
       <section>
         <h3>1. Установка приложения</h3>
         <p>
-          После оплаты откройте «Мои приложения» и выберите приложение. Получите
-          персональную ссылку, откройте её в Safari на iPhone и подтвердите
-          установку. Ссылка действует ограниченное время — новую можно получить
-          в том же заказе.
+          После оплаты откройте «Мои приложения», выберите приложение и нажмите
+          «Установить». Подтвердите установку на iPhone. Если окно не появилось,
+          откройте установочную ссылку в Safari.
         </p>
       </section>
       <section>
@@ -1105,6 +1104,10 @@ function OrderPage({
     setGrantBusy(true);
     setGrantError("");
     try {
+      if (grant && Date.parse(grant.expires_at) > Date.now()) {
+        external(grant.url);
+        return;
+      }
       const next = await api<Grant>(
         `/orders/${encodeURIComponent(order.id)}/items/${encodeURIComponent(selected.app_slug)}/install-link`,
         { method: "POST" },
@@ -1135,11 +1138,16 @@ function OrderPage({
   }
   async function copyLink() {
     if (!grant) return;
+    if (Date.parse(grant.expires_at) <= Date.now()) {
+      setGrant(null);
+      toast("Ссылка истекла. Нажмите «Установить приложение».");
+      return;
+    }
     try {
       await navigator.clipboard.writeText(grant.url);
       toast("Ссылка скопирована. Откройте её в Safari на iPhone.");
     } catch {
-      toast("Не удалось скопировать. Нажмите «Открыть установку».");
+      toast("Не удалось скопировать. Нажмите «Установить приложение».");
     }
   }
   const paymentScreen =
@@ -1409,29 +1417,20 @@ function OrderPage({
           {step === "install" ? (
             <div className="surface installation-panel">
               <h2>Установите приложение</h2>
-              <p>
-                Откройте персональную ссылку в Safari на iPhone и подтвердите
-                системный запрос установки.
-              </p>
+              <p>Подтвердите установку в системном окне на iPhone.</p>
               <p className="muted small-text">
                 Перед переустановкой сохраните настройки существующей копии
                 приложения.
               </p>
               <Button className="full" busy={grantBusy} onClick={installLink}>
-                {hasValidGrant
-                  ? "Получить новую ссылку"
-                  : "Установить приложение"}
+                Установить приложение
                 <Icon name="arrow" size={17} />
               </Button>
               {hasValidGrant && (
                 <div className="grant">
-                  <Button
-                    className="full"
-                    secondary
-                    onClick={() => external(grant.url)}
-                  >
-                    Открыть установку <Icon name="external" size={17} />
-                  </Button>
+                  <p className="muted small-text">
+                    Нет окна установки? Откройте ссылку в Safari.
+                  </p>
                   <Button className="full" secondary onClick={copyLink}>
                     Скопировать для Safari <Icon name="copy" size={17} />
                   </Button>

@@ -1,4 +1,5 @@
 """Private, unchanged IPA delivery; only the main Info.plist is inspected."""
+import base64
 import hashlib
 import html
 import os
@@ -18,6 +19,21 @@ PRIVATE_HEADERS = {
     'X-Content-Type-Options': 'nosniff',
     'X-Robots-Tag': 'noindex, nofollow, noarchive',
     'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+}
+
+INSTALL_SCRIPT = '''(function () {
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent || '') ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (!isIOS) return;
+  const button = document.getElementById('install-app');
+  if (!button) return;
+  try { window.location.assign(button.href); } catch (_) {}
+})();'''
+
+INSTALL_PAGE_HEADERS = {
+    **PRIVATE_HEADERS,
+    'Content-Security-Policy': PRIVATE_HEADERS['Content-Security-Policy'] +
+        "; script-src 'sha256-" + base64.b64encode(hashlib.sha256(INSTALL_SCRIPT.encode()).digest()).decode() + "'",
 }
 
 
@@ -113,12 +129,11 @@ class IPAFile:
 <style>body{{font:17px/1.55 system-ui;background:#fff;color:#151515;margin:0;padding:24px}}main{{max-width:460px;margin:6vh auto;background:#f1f1f1;padding:28px;border-radius:24px}}h1{{font-size:34px}}a{{display:block;background:#0057ff;color:white;text-align:center;text-decoration:none;padding:17px;border-radius:14px;font-weight:600}}small{{display:block;color:#777;margin-top:24px}}.meta{{color:#777}}</style></head>
 <body><main><p class="meta">Аппки · Установка на iPhone</p><h1>{title}</h1>
 <p class="meta">{html.escape(self.version)} · {round(self.size/1000000)} МБ · iOS {html.escape(self.minimum_ios)}+</p>
-<p>Откройте эту страницу в Safari на iPhone и подтвердите установку.</p>
-<p>Если {title} уже установлен, сохраните настройки. iPhone может попросить удалить прежнюю копию.</p>
-<a href="{html.escape(link, quote=True)}">Установить {title}</a>
-<p>Дождитесь завершения загрузки на главном экране. Затем вернитесь в заказ в Telegram и откройте инструкцию активации.</p>
-<small>Ссылка временная и даёт доступ к файлу приложения. Не пересылайте её. Пароль Apple Account на этой странице не запрашивается.</small>
-</main></body></html>'''
+<p>Подтвердите установку. Если окно не появилось, нажмите кнопку ниже.</p>
+<a id="install-app" href="{html.escape(link, quote=True)}">Установить {title}</a>
+<p>После установки вернитесь в Telegram для активации.</p>
+<small>Ссылка временная. Не пересылайте её.</small>
+</main><script>{INSTALL_SCRIPT}</script></body></html>'''
 
     def response(self, request: Request):
         try:

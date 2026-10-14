@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, StrictBool, ValidationError, model_valida
 from .auth import InvalidTelegramData, token_hash, validate_init_data
 from .config import Settings
 from .db import Database
-from .ota import IPAFile, PRIVATE_HEADERS
+from .ota import INSTALL_PAGE_HEADERS, IPAFile, PRIVATE_HEADERS
 from .payments import (PaymentConfigurationError, PaymentProviderError, PaymentValidationError,
                        YooKassaClient, validate_payment)
 
@@ -648,7 +648,7 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         app_file = check_grant(token, request)
         content = app_file.page(cfg.public_base_url, token).encode()
         return Response(content if request.method != 'HEAD' else b'', media_type='text/html',
-                        headers={**PRIVATE_HEADERS, 'Content-Length': str(len(content))})
+                        headers={**INSTALL_PAGE_HEADERS, 'Content-Length': str(len(content))})
 
     @app.api_route('/install/{token}/manifest.plist', methods=['GET', 'HEAD'])
     def manifest(token: str, request: Request):
