@@ -30,12 +30,24 @@ DEFAULT_TOOL = Path('/usr/local/libexec/appki-ipatool')
 DEFAULT_REGISTRY = Path('/var/lib/appki/artifacts/registry.json')
 DEFAULT_ARTIFACT_ROOT = Path('/var/lib/appki/artifacts')
 IPATOOL_COMMIT = '747d66fc0acd896759f43a206a7ddfa2ab49e584'
-IPATOOL_ADAPTER_VERSION = '2.6.0-appki.1'
+IPATOOL_ADAPTER_VERSION = '2.6.0-appki.2'
 _IDENTIFIER = re.compile(r'[a-z][a-z0-9_-]{0,63}\Z')
 _SLUG = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z')
 _BUNDLE = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+\Z')
 _DIGEST = re.compile(r'[0-9a-f]{64}\Z')
 _JOB_ID = re.compile(r'[0-9a-f]{32}\Z')
+_ERROR_CODES = frozenset({
+    'requires_auth', 'requires_2fa', 'account_identity_mismatch', 'license_required',
+    'network_timeout', 'network_failed', 'dns_failed', 'tls_failed', 'rate_limited',
+    'upstream_http_error', 'upstream_response_invalid', 'credentials_rejected',
+    'account_disabled', 'machine_identity_failed', 'runtime_setup_failed',
+    'private_storage_failed', 'authentication_failed', 'authentication_rejected', 'acquisition_failed',
+    'auth_success_unconfirmed', 'auth_cache_unconfirmed', 'tool_timeout',
+    'tool_unavailable', 'tool_crashed', 'invalid_tool_output',
+})
+_ERROR_STAGES = frozenset({'local_storage', 'machine', 'bag', 'assets', 'runtime',
+    'signer_setup', 'authentication', 'verification', 'signer_close', 'account_binding',
+    'download', 'runner', 'unknown'})
 
 
 class AcquisitionError(Exception):
@@ -126,12 +138,31 @@ def _json_messages(result: CommandResult) -> list[dict[str, Any]]:
     return messages
 
 
+def _safe_diagnostic(code: Any, stage: Any, http_status: Any = None) -> dict[str, Any] | None:
+    if not isinstance(code, str) or code not in _ERROR_CODES:
+        return None
+    diagnostic = {'code': code, 'stage': stage if isinstance(stage, str) and stage in _ERROR_STAGES else 'unknown'}
+    if type(http_status) is int and 100 <= http_status <= 599:
+        diagnostic['http_status'] = http_status
+    return diagnostic
+
+
+def _diagnostic(result: CommandResult, *, fallback='acquisition_failed') -> dict[str, Any]:
+    """Accept only adapter enums/numeric status; discard all arbitrary text."""
+    for message in reversed(_json_messages(result)):
+        diagnostic = _safe_diagnostic(message.get('error'), message.get('stage'), message.get('http_status'))
+        if diagnostic is not None:
+            return diagnostic
+    if result.returncode < 0 or result.returncode == 2:
+        return {'code': 'tool_crashed', 'stage': 'runner'}
+    return _safe_diagnostic(fallback, 'unknown') or {'code': 'acquisition_failed', 'stage': 'unknown'}
+
+
 def _outcome(result: CommandResult) -> str:
-    # Only normalized adapter codes are retained. Unknown raw output is discarded.
-    codes = {message.get('error') for message in _json_messages(result) if isinstance(message.get('error'), str)}
-    if 'requires_2fa' in codes:
+    code = _diagnostic(result)['code']
+    if code == 'requires_2fa':
         return 'requires_2fa'
-    if 'requires_auth' in codes or 'account_identity_mismatch' in codes:
+    if code in ('requires_auth', 'account_identity_mismatch', 'credentials_rejected', 'account_disabled', 'authentication_rejected'):
         return 'requires_auth'
     return 'failed'
 
@@ -152,7 +183,8 @@ class AcquisitionWorker:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS profiles (
                     id TEXT PRIMARY KEY, label TEXT NOT NULL, status TEXT NOT NULL,
-                    identity_sha256 TEXT, created_at INTEGER NOT NULL
+                    identity_sha256 TEXT, created_at INTEGER NOT NULL,
+                    last_error_code TEXT, last_error_stage TEXT, last_http_status INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES profiles(id),
@@ -163,6 +195,10 @@ class AcquisitionWorker:
                     updated_at INTEGER NOT NULL
                 );
             ''')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(profiles)')}
+            for column, kind in (('last_error_code', 'TEXT'), ('last_error_stage', 'TEXT'), ('last_http_status', 'INTEGER')):
+                if column not in columns:
+                    db.execute(f'ALTER TABLE profiles ADD COLUMN {column} {kind}')
         os.chmod(self.database_path, 0o600)
 
     @contextmanager
@@ -215,7 +251,8 @@ class AcquisitionWorker:
                     stream.write(secrets.token_urlsafe(48) + '\n')
                     stream.flush()
                     os.fsync(stream.fileno())
-                db.execute('INSERT INTO profiles VALUES (?,?,?,?,?)', (account_id, label, 'requires_auth', None, int(time.time())))
+                db.execute('INSERT INTO profiles (id,label,status,identity_sha256,created_at) VALUES (?,?,?,?,?)',
+                           (account_id, label, 'requires_auth', None, int(time.time())))
         return self.profile(account_id)
 
     def profile(self, account_id: str) -> dict[str, Any]:
@@ -224,8 +261,14 @@ class AcquisitionWorker:
             row = db.execute('SELECT * FROM profiles WHERE id=?', (account_id,)).fetchone()
         if row is None:
             raise AcquisitionError('profile_not_found')
-        return {'id': row['id'], 'label': row['label'], 'status': row['status'],
-                'identity_bound': row['identity_sha256'] is not None, 'created_at': row['created_at']}
+        result = {'id': row['id'], 'label': row['label'], 'status': row['status'],
+                  'identity_bound': row['identity_sha256'] is not None, 'created_at': row['created_at'], 'last_error': None}
+        if row['last_error_code'] in _ERROR_CODES:
+            result['last_error'] = {'code': row['last_error_code'],
+                'stage': row['last_error_stage'] if row['last_error_stage'] in _ERROR_STAGES else 'unknown'}
+            if type(row['last_http_status']) is int and 100 <= row['last_http_status'] <= 599:
+                result['last_error']['http_status'] = row['last_http_status']
+        return result
 
     def profiles(self) -> list[dict[str, Any]]:
         with self._db() as db:
@@ -257,33 +300,44 @@ class AcquisitionWorker:
             argv.append('--non-interactive')
         return self.runner.run(argv + arguments, env=env, interactive=interactive, lock_fd=lock_fd)
 
-    def _profile_status(self, account_id: str, status: str) -> None:
+    def _profile_status(self, account_id: str, status: str, *, diagnostic: dict[str, Any] | None = None) -> None:
+        diagnostic = (_safe_diagnostic(diagnostic.get('code'), diagnostic.get('stage'), diagnostic.get('http_status')) or {}) if diagnostic is not None else {}
         with self._db() as db:
-            db.execute('UPDATE profiles SET status=? WHERE id=?', (status, account_id))
+            db.execute('UPDATE profiles SET status=?,last_error_code=?,last_error_stage=?,last_http_status=? WHERE id=?',
+                       (status, diagnostic.get('code'), diagnostic.get('stage'), diagnostic.get('http_status'), account_id))
 
     def login(self, account_id: str) -> dict[str, Any]:
         account_id = _identifier(account_id)
         with self._lock(account_id) as lock_fd:
             self.profile(account_id)
-            result = self._command(account_id, ['auth', 'login'], interactive=True, lock_fd=lock_fd)
+            try:
+                result = self._command(account_id, ['auth', 'login'], interactive=True, lock_fd=lock_fd)
+            except AcquisitionError as exc:
+                if exc.code not in ('tool_timeout', 'tool_unavailable', 'invalid_tool_output'):
+                    raise
+                self._profile_status(account_id, 'requires_auth', diagnostic={'code': exc.code, 'stage': 'runner'})
+                return self.profile(account_id)
             identities = [message.get('account_identity_sha256') for message in _json_messages(result)
                           if message.get('success') is True]
             if result.returncode != 0 or not identities or not isinstance(identities[-1], str) or not _DIGEST.fullmatch(identities[-1]):
-                self._profile_status(account_id, _outcome(result) if _outcome(result) != 'failed' else 'requires_auth')
+                self._profile_status(account_id, _outcome(result) if _outcome(result) != 'failed' else 'requires_auth',
+                    diagnostic=_diagnostic(result, fallback='auth_success_unconfirmed' if result.returncode == 0 else 'authentication_failed'))
                 return self.profile(account_id)
             identity = identities[-1]
             cached = self._command(account_id, ['auth', 'info'], lock_fd=lock_fd)
             cached_identities = [message.get('account_identity_sha256') for message in _json_messages(cached)
                                  if message.get('success') is True]
             if cached.returncode != 0 or not cached_identities or cached_identities[-1] != identity:
-                self._profile_status(account_id, 'requires_auth')
+                self._profile_status(account_id, 'requires_auth', diagnostic={'code': 'auth_cache_unconfirmed', 'stage': 'local_storage'})
                 raise AcquisitionError('account_identity_mismatch')
             with self._db() as db:
                 old_identity = db.execute('SELECT identity_sha256 FROM profiles WHERE id=?', (account_id,)).fetchone()[0]
                 if old_identity and old_identity != identity:
-                    db.execute('UPDATE profiles SET status=? WHERE id=?', ('requires_auth', account_id))
+                    db.execute('UPDATE profiles SET status=?,last_error_code=?,last_error_stage=?,last_http_status=NULL WHERE id=?',
+                               ('requires_auth', 'account_identity_mismatch', 'account_binding', account_id))
                 else:
-                    db.execute('UPDATE profiles SET identity_sha256=?,status=? WHERE id=?', (identity, 'ready', account_id))
+                    db.execute('UPDATE profiles SET identity_sha256=?,status=?,last_error_code=NULL,last_error_stage=NULL,last_http_status=NULL WHERE id=?',
+                               (identity, 'ready', account_id))
             if old_identity and old_identity != identity:
                 raise AcquisitionError('account_identity_mismatch')
         return self.profile(account_id)
@@ -367,9 +421,9 @@ class AcquisitionWorker:
                                   and message.get('output') == str(output) for message in _json_messages(result))
                     if result.returncode != 0 or not success or not output.is_file():
                         status = _outcome(result)
-                        self._job_status(job_id, status, error_code=status if status != 'failed' else 'download_failed')
+                        self._job_status(job_id, status, error_code=_diagnostic(result)['code'])
                         if status in ('requires_auth', 'requires_2fa'):
-                            self._profile_status(job['account_id'], status)
+                            self._profile_status(job['account_id'], status, diagnostic=_diagnostic(result))
                         return self.job(job_id)
                     os.chmod(output, 0o600)
                     self._job_status(job_id, 'downloaded')

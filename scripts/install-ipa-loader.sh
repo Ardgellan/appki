@@ -75,17 +75,25 @@ chown -R appki-acquirer:appki-acquirer "$ipa_build_dir"
 runuser -u appki-acquirer -- env \
   GOCACHE="$ipa_worker_root/build-cache" GOMODCACHE="$ipa_worker_root/module-cache" \
   CGO_ENABLED=1 GOTOOLCHAIN=local GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
+  "$ipa_toolchain/go/bin/go" -C "$ipa_source_dir" generate ./pkg/...
+runuser -u appki-acquirer -- env \
+  GOCACHE="$ipa_worker_root/build-cache" GOMODCACHE="$ipa_worker_root/module-cache" \
+  CGO_ENABLED=1 GOTOOLCHAIN=local GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
+  "$ipa_toolchain/go/bin/go" -C "$ipa_source_dir" test ./pkg/appstore ./pkg/http
+runuser -u appki-acquirer -- env \
+  GOCACHE="$ipa_worker_root/build-cache" GOMODCACHE="$ipa_worker_root/module-cache" \
+  CGO_ENABLED=1 GOTOOLCHAIN=local GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
   "$ipa_toolchain/go/bin/go" -C "$ipa_source_dir" test ./cmd -run '^TestPrivate'
 runuser -u appki-acquirer -- env \
   GOCACHE="$ipa_worker_root/build-cache" GOMODCACHE="$ipa_worker_root/module-cache" \
   CGO_ENABLED=1 GOTOOLCHAIN=local GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
   "$ipa_toolchain/go/bin/go" -C "$ipa_source_dir" test \
-  ./pkg/appstore/appki_private.go ./pkg/appstore/appki_private_test.go
+  ./pkg/appstore/appki_private.go ./pkg/appstore/appki_private_test.go ./pkg/appstore/constants.go
 runuser -u appki-acquirer -- env \
   GOCACHE="$ipa_worker_root/build-cache" GOMODCACHE="$ipa_worker_root/module-cache" \
   CGO_ENABLED=1 GOTOOLCHAIN=local GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org \
   "$ipa_toolchain/go/bin/go" -C "$ipa_source_dir" build -trimpath \
-  -ldflags='-s -w -X github.com/majd/ipatool/v2/cmd.version=2.6.0-appki.1' \
+  -ldflags='-s -w -X github.com/majd/ipatool/v2/cmd.version=2.6.0-appki.2' \
   -o "$ipa_build_dir/appki-ipatool" .
 install -m 755 -o root -g root "$ipa_build_dir/appki-ipatool" "$ipa_tool"
 cat > "$ipa_build_dir/appki-acquire" <<'WRAPPER'

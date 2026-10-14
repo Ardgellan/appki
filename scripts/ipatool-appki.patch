@@ -1,12 +1,16 @@
 --- a/cmd/appki_private.go
 +++ b/cmd/appki_private.go
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,162 @@
 +package cmd
 +
 +import (
++	"context"
++	"crypto/x509"
 +	"errors"
 +	"github.com/majd/ipatool/v2/pkg/appstore"
++	appkihttp "github.com/majd/ipatool/v2/pkg/http"
 +	"github.com/spf13/cobra"
++	"net"
 +	"os"
 +	"path/filepath"
 +	"strings"
@@ -42,34 +46,141 @@
 +	return nil
 +}
 +
-+// Never send arbitrary Apple response bodies, metadata or credentials to logs.
-+func privateErrorCode(err error) string {
-+	if errors.Is(err, appstore.ErrAuthCodeRequired) {
-+		return "requires_2fa"
-+	}
++type privateDiagnosticResult struct {
++	Code       string
++	Stage      string
++	HTTPStatus int
++}
++
++// Only bounded enums/status leave the process. Never return error text, URLs,
++// account data, Apple response bodies, correlation IDs or arbitrary metadata.
++func privateDiagnostic(err error) privateDiagnosticResult {
 +	text := strings.ToLower(err.Error())
-+	if strings.Contains(text, "account_identity_mismatch") {
-+		return "account_identity_mismatch"
-+	}
-+	if strings.Contains(text, "license") {
-+		return "license_required"
-+	}
-+	for _, value := range []string{"failed to get account", "password token", "invalid credentials", "authentication", "sign-in", "account is disabled", "password is required", "email is required"} {
-+		if strings.Contains(text, value) {
-+			return "requires_auth"
++	diagnostic := privateDiagnosticResult{Code: "acquisition_failed", Stage: "unknown"}
++	for _, pair := range [][2]string{
++		{"failed to get mac address", "machine"}, {"failed to get bag", "bag"},
++		{"apple sap assets", "assets"}, {"load sap assets", "assets"},
++		{"unicorn", "runtime"}, {"guest", "runtime"},
++		{"failed to initialize sap action signer", "signer_setup"},
++		{"2fa verification", "verification"}, {"sign-in request", "authentication"},
++		{"authentication", "authentication"}, {"failed to close sap", "signer_close"},
++		{"account_identity_mismatch", "account_binding"}, {"passphrase", "local_storage"},
++		{"failed to get account", "local_storage"}, {"failed to save account", "local_storage"},
++	} {
++		if strings.Contains(text, pair[0]) {
++			diagnostic.Stage = pair[1]
++			break
 +		}
 +	}
-+	return "acquisition_failed"
++	var response *appkihttp.UnexpectedResponseError
++	if errors.As(err, &response) && response.StatusCode >= 100 && response.StatusCode <= 599 {
++		diagnostic.HTTPStatus = response.StatusCode
++	}
++	if errors.Is(err, appstore.ErrAuthCodeRequired) {
++		diagnostic.Code, diagnostic.Stage = "requires_2fa", "verification"
++		return diagnostic
++	}
++	var privateResponse *appstore.PrivateAuthenticationResponseError
++	if errors.As(err, &privateResponse) {
++		diagnostic.Stage = "authentication"
++		switch privateResponse.Code {
++		case "account_disabled", "authentication_rejected", "upstream_response_invalid":
++			diagnostic.Code = privateResponse.Code
++		}
++		if privateResponse.HTTPStatus >= 100 && privateResponse.HTTPStatus <= 599 {
++			diagnostic.HTTPStatus = privateResponse.HTTPStatus
++		}
++		return diagnostic
++	}
++	if strings.Contains(text, "account_identity_mismatch") {
++		diagnostic.Code = "account_identity_mismatch"
++		return diagnostic
++	}
++	var dns *net.DNSError
++	var timeout net.Error
++	var operation *net.OpError
++	var unknownCA x509.UnknownAuthorityError
++	var hostname x509.HostnameError
++	var certificate x509.CertificateInvalidError
++	if errors.As(err, &dns) {
++		diagnostic.Code = "dns_failed"
++		return diagnostic
++	}
++	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
++		diagnostic.Code = "network_timeout"
++		return diagnostic
++	}
++	if errors.As(err, &unknownCA) || errors.As(err, &hostname) || errors.As(err, &certificate) {
++		diagnostic.Code = "tls_failed"
++		return diagnostic
++	}
++	if errors.As(err, &operation) {
++		diagnostic.Code = "network_failed"
++		return diagnostic
++	}
++	if diagnostic.HTTPStatus == 429 {
++		diagnostic.Code = "rate_limited"
++		return diagnostic
++	}
++	if errors.As(err, &response) {
++		diagnostic.Code = "upstream_response_invalid"
++		if diagnostic.HTTPStatus >= 300 {
++			diagnostic.Code = "upstream_http_error"
++		}
++		return diagnostic
++	}
++	if strings.Contains(text, "account is disabled") {
++		diagnostic.Code = "account_disabled"
++		return diagnostic
++	}
++	if strings.Contains(text, "password is incorrect") || strings.Contains(text, "invalid credentials") {
++		diagnostic.Code, diagnostic.Stage = "credentials_rejected", "authentication"
++		return diagnostic
++	}
++	if strings.Contains(text, "license") {
++		diagnostic.Code = "license_required"
++		return diagnostic
++	}
++	if strings.Contains(text, "failed to get account") || strings.Contains(text, "password token") {
++		diagnostic.Code = "requires_auth"
++		return diagnostic
++	}
++	if strings.Contains(text, "no usable authentication response") {
++		diagnostic.Code, diagnostic.Stage = "upstream_response_invalid", "authentication"
++		return diagnostic
++	}
++	switch diagnostic.Stage {
++	case "machine":
++		diagnostic.Code = "machine_identity_failed"
++	case "assets", "runtime", "signer_setup", "signer_close":
++		diagnostic.Code = "runtime_setup_failed"
++	case "local_storage":
++		diagnostic.Code = "private_storage_failed"
++	case "authentication", "verification":
++		diagnostic.Code = "authentication_failed"
++	case "bag":
++		diagnostic.Code = "upstream_response_invalid"
++	}
++	return diagnostic
 +}
 --- a/cmd/appki_private_test.go
 +++ b/cmd/appki_private_test.go
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,94 @@
 +package cmd
 +
 +import (
++	"context"
++	"errors"
++	"fmt"
++	"github.com/majd/ipatool/v2/pkg/appstore"
++	appkihttp "github.com/majd/ipatool/v2/pkg/http"
 +	"github.com/spf13/cobra"
++	"net"
++	"net/http"
++	"net/http/httptest"
 +	"os"
 +	"path/filepath"
++	"strings"
 +	"testing"
 +)
 +
@@ -94,128 +205,115 @@
 +	}
 +	keychainPassphrase = ""
 +}
++
++func TestPrivateSafeDiagnostic(t *testing.T) {
++	cases := []struct {
++		err         error
++		code, stage string
++		status      int
++	}{
++		{fmt.Errorf("sign-in request failed: %w", &appkihttp.UnexpectedResponseError{StatusCode: 301, Snippet: "PASSWORD TOKEN ACCOUNT"}), "upstream_http_error", "authentication", 301},
++		{fmt.Errorf("failed to get bag: %w", &appkihttp.UnexpectedResponseError{StatusCode: 403, CorrelationID: "SECRET"}), "upstream_http_error", "bag", 403},
++		{fmt.Errorf("sign-in request failed: %w", &appkihttp.UnexpectedResponseError{StatusCode: 429}), "rate_limited", "authentication", 429},
++		{fmt.Errorf("sign-in request failed: %w", context.DeadlineExceeded), "network_timeout", "authentication", 0},
++		{fmt.Errorf("failed to get bag: %w", &net.DNSError{Name: "SECRET", Err: "fixture"}), "dns_failed", "bag", 0},
++		{fmt.Errorf("failed to initialize SAP action signer: load Unicorn SECRET"), "runtime_setup_failed", "runtime", 0},
++		{appstore.ErrAuthCodeRequired, "requires_2fa", "verification", 0},
++		{&appstore.PrivateAuthenticationResponseError{Code: "upstream_response_invalid", HTTPStatus: 200}, "upstream_response_invalid", "authentication", 200},
++		{&appstore.PrivateAuthenticationResponseError{Code: "authentication_rejected", HTTPStatus: 200}, "authentication_rejected", "authentication", 200},
++		{&appstore.PrivateAuthenticationResponseError{Code: "PASSWORD", HTTPStatus: 700}, "acquisition_failed", "authentication", 0},
++		{errors.New("PASSWORD HTTP 401 SECRET"), "acquisition_failed", "unknown", 0},
++	}
++	for _, item := range cases {
++		diagnostic := privateDiagnostic(item.err)
++		if diagnostic.Code != item.code || diagnostic.Stage != item.stage || diagnostic.HTTPStatus != item.status {
++			t.Fatalf("unexpected normalized diagnostic: %+v", diagnostic)
++		}
++		if strings.Contains(fmt.Sprint(diagnostic), "SECRET") || strings.Contains(fmt.Sprint(diagnostic), "PASSWORD") {
++			t.Fatal("raw diagnostic escaped")
++		}
++	}
++}
++
++func TestPrivateAuthenticationNeverAutomaticallyFollowsRedirect(t *testing.T) {
++	followed := false
++	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { followed = true; w.WriteHeader(200) }))
++	defer destination.Close()
++	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Location", destination.URL)
++		w.WriteHeader(302)
++	}))
++	defer origin.Close()
++	client := appkihttp.NewClient[interface{}](appkihttp.Args{Authentication: true})
++	for _, suffix := range []string{"", "/"} {
++		req, err := http.NewRequest("POST", origin.URL+"/WebObjects/MZFinance.woa/wa/authenticate"+suffix, strings.NewReader("public fixture"))
++		if err != nil {
++			t.Fatal(err)
++		}
++		res, err := client.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		res.Body.Close()
++		if res.StatusCode != 302 || followed {
++			t.Fatal("signed authentication redirect was followed")
++		}
++	}
++}
 --- a/cmd/auth.go
 +++ b/cmd/auth.go
-@@ -37,7 +37,7 @@
- 			}
- 
- 			if email == "" && interactive {
+@@ -40 +40 @@
 -				value, err := readPrompt("enter email: ", false)
 +				value, err := readPrompt("enter Apple Account: ", true)
- 				if err != nil {
- 					return fmt.Errorf("failed to read email: %w", err)
- 				}
-@@ -64,7 +64,7 @@
- 			return retry.Do(func() error {
- 				if errors.Is(lastErr, appstore.ErrAuthCodeRequired) && interactive {
- 					var err error
+@@ -67 +67 @@
 -					authCode, err = readPrompt("enter 2FA code: ", false)
 +					authCode, err = readPrompt("enter 2FA code: ", true)
- 					if err != nil {
- 						return fmt.Errorf("failed to read auth code: %w", err)
- 					}
-@@ -84,15 +84,14 @@
- 					if errors.Is(err, appstore.ErrAuthCodeRequired) && !interactive {
- 						dependencies.Logger.Log().Msg("2FA code is required; run the command again and supply a code using the `--auth-code` flag")
- 
+@@ -87 +87 @@
 -						return nil
 +						return appstore.ErrAuthCodeRequired
- 					}
- 
- 					return err
- 				}
- 
- 				dependencies.Logger.Log().
+@@ -94,2 +94 @@
 -					Str("name", output.Account.Name).
 -					Str("email", output.Account.Email).
 +					Str("account_identity_sha256", appstore.PrivateAccountIdentity(output.Account.Email)).
- 					Bool("success", true).
- 					Send()
- 
-@@ -130,8 +129,7 @@
- 			}
- 
- 			dependencies.Logger.Log().
+@@ -133,2 +132 @@
 -				Str("name", output.Account.Name).
 -				Str("email", output.Account.Email).
 +				Str("account_identity_sha256", appstore.PrivateAccountIdentity(output.Account.Email)).
- 				Bool("success", true).
- 				Send()
- 
 --- a/cmd/common.go
 +++ b/cmd/common.go
-@@ -23,6 +23,7 @@
- 
- var dependencies = Dependencies{}
- var keychainPassphrase string
+@@ -25,0 +26 @@
 +var keychainPassphraseFile string
- 
- type Dependencies struct {
- 	Logger    log.Logger
-@@ -61,11 +62,7 @@
- // newKeychain returns a new keychain instance.
- func newKeychain(stateDirectory string, interactive bool) keychain.Keychain {
- 	ring := util.Must(openKeyring(keyring.Config{
+@@ -64,5 +65 @@
 -		AllowedBackends: []keyring.BackendType{
 -			keyring.KeychainBackend,
 -			keyring.SecretServiceBackend,
 -			keyring.FileBackend,
 -		},
 +		AllowedBackends:          []keyring.BackendType{keyring.FileBackend},
- 		ServiceName:              KeychainServiceName,
- 		KeychainTrustApplication: true,
- 		FileDir:                  stateDirectory,
 --- a/cmd/root.go
 +++ b/cmd/root.go
-@@ -2,10 +2,8 @@
- 
- import (
- 	"context"
+@@ -5 +4,0 @@
 -	"errors"
- 	"reflect"
- 
+@@ -8 +6,0 @@
 -	"github.com/majd/ipatool/v2/pkg/appstore"
- 	"github.com/spf13/cobra"
- 	"github.com/thediveo/enumflag/v2"
- )
-@@ -29,10 +27,14 @@
- 		SilenceErrors: true,
- 		SilenceUsage:  true,
- 		Version:       version,
+@@ -32 +30,4 @@
 -		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 +		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 +			if err := preparePrivateAdapter(cmd); err != nil {
 +				return err
 +			}
- 			ctx := context.WithValue(context.Background(), interactiveKey, !nonInteractive)
- 			cmd.SetContext(ctx)
- 			initWithCommand(cmd)
+@@ -35,0 +37 @@
 +			return nil
- 		},
- 	}
- 
-@@ -43,12 +45,12 @@
- 		}, enumflag.EnumCaseSensitive), "format", "", "sets output format for command; can be 'text', 'json'")
- 	cmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "enables verbose logs")
- 	cmd.PersistentFlags().BoolVarP(&nonInteractive, "non-interactive", "", false, "run in non-interactive session")
+@@ -46 +48,2 @@
 -	cmd.PersistentFlags().StringVar(&keychainPassphrase, "keychain-passphrase", "", "passphrase for unlocking keychain")
 +	cmd.PersistentFlags().StringVar(&keychainPassphrase, "keychain-passphrase", "", "disabled in private adapter")
 +	cmd.PersistentFlags().StringVar(&keychainPassphraseFile, "keychain-passphrase-file", "", "protected passphrase file")
- 
- 	cmd.AddCommand(authCmd())
- 	cmd.AddCommand(downloadCmd())
- 	cmd.AddCommand(listPurchasesCmd())
+@@ -51 +53,0 @@
 -	cmd.AddCommand(purchaseCmd())
- 	cmd.AddCommand(searchCmd())
- 	cmd.AddCommand(ListVersionsCmd())
- 	cmd.AddCommand(getVersionMetadataCmd())
-@@ -63,21 +65,11 @@
- 
- 	if err != nil {
- 		if reflect.ValueOf(dependencies).IsZero() {
+@@ -66 +68 @@
 -			initWithCommand(cmd)
--		}
--
++			dependencies.Logger = newLogger(OutputFormatJSON, false)
+@@ -69,8 +71,4 @@
 -		var appstoreErr *appstore.Error
 -		if errors.As(err, &appstoreErr) {
 -			dependencies.Logger.Verbose().Stack().
@@ -224,30 +322,28 @@
 -				Send()
 -		} else {
 -			dependencies.Logger.Verbose().Stack().Err(err).Send()
-+			dependencies.Logger = newLogger(OutputFormatJSON, false)
- 		}
- 
- 		dependencies.Logger.Error().
++		diagnostic := privateDiagnostic(err)
++		event := dependencies.Logger.Error().Str("error", diagnostic.Code).Str("stage", diagnostic.Stage)
++		if diagnostic.HTTPStatus != 0 {
++			event = event.Int("http_status", diagnostic.HTTPStatus)
+@@ -78,5 +76 @@
+-
+-		dependencies.Logger.Error().
 -			Err(err).
-+			Str("error", privateErrorCode(err)).
- 			Bool("success", false).
- 			Send()
- 
+-			Bool("success", false).
+-			Send()
++		event.Bool("success", false).Send()
 --- a/cmd/state_directory.go
 +++ b/cmd/state_directory.go
-@@ -1,61 +1,20 @@
- package cmd
- 
- import (
+@@ -4 +4,2 @@
 -	"fmt"
 +	"errors"
 +	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
- 	"path/filepath"
+@@ -6,3 +6,0 @@
 -	"strings"
 -
 -	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
- )
- 
+@@ -11,11 +9,5 @@
 -// prepareStateDirectory resolves and migrates session storage before it is opened.
 -func prepareStateDirectory(os operatingsystem.OperatingSystem, homeDirectory string) (string, error) {
 -	legacyDirectory := filepath.Join(homeDirectory, ConfigDirectoryName)
@@ -264,7 +360,7 @@
 +	base := os.Getenv("XDG_STATE_HOME")
 +	if !filepath.IsAbs(base) {
 +		return "", errors.New("private_state_required")
- 	}
+@@ -23,4 +15,3 @@
 -
 -	info, err := os.Stat(legacyDirectory)
 -	if err != nil && !os.IsNotExist(err) {
@@ -272,7 +368,7 @@
 +	directory := filepath.Join(base, "ipatool")
 +	if err := os.MkdirAll(directory, 0700); err != nil {
 +		return "", errors.New("private_state_unavailable")
- 	}
+@@ -28,33 +19 @@
 -
 -	if err == nil {
 -		if !info.IsDir() {
@@ -307,16 +403,16 @@
 -
 -	return stateDirectory, nil
 +	return directory, nil
- }
 --- a/pkg/appstore/appki_private.go
 +++ b/pkg/appstore/appki_private.go
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,53 @@
 +package appstore
 +
 +import (
 +	"crypto/sha256"
 +	"encoding/hex"
 +	"errors"
++	"net/url"
 +	"os"
 +	"strings"
 +)
@@ -333,12 +429,45 @@
 +	}
 +	return nil
 +}
++
++// Narrow backport of upstream f9aa653/1ec8b3e: validate before normalizing;
++// retain the official bag/pod HTTPS host and routing query exactly.
++func normalizePrivateAuthEndpoint(endpoint string) (string, error) {
++	parsed, err := url.Parse(endpoint)
++	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
++		parsed.Fragment != "" || parsed.RawPath != "" || (parsed.Port() != "" && parsed.Port() != "443") {
++		return "", errors.New("invalid authentication endpoint")
++	}
++	host := strings.ToLower(parsed.Hostname())
++	if host != PrivateAppStoreAPIDomain && !strings.HasSuffix(host, "-buy.itunes.apple.com") {
++		return "", errors.New("unsupported authentication endpoint")
++	}
++	if parsed.Path != PrivateAppStoreAPIPathAuth && parsed.Path != PrivateAppStoreAPIPathAuth+"/" {
++		return "", errors.New("unsupported authentication endpoint")
++	}
++	parsed.Path = PrivateAppStoreAPIPathAuth + "/"
++	return parsed.String(), nil
++}
++
++// Carries only a static code and numeric HTTP status. Apple messages, bodies,
++// credentials and arbitrary response metadata never enter this error.
++type PrivateAuthenticationResponseError struct {
++	Code       string
++	HTTPStatus int
++}
++
++func (*PrivateAuthenticationResponseError) Error() string {
++	return "private authentication response failed"
++}
 --- a/pkg/appstore/appki_private_test.go
 +++ b/pkg/appstore/appki_private_test.go
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,50 @@
 +package appstore
 +
-+import "testing"
++import (
++	"net/url"
++	"testing"
++)
 +
 +func TestPrivateAccountBinding(t *testing.T) {
 +	t.Setenv("APPKI_EXPECTED_ACCOUNT_SHA256", PrivateAccountIdentity("owner@example.invalid"))
@@ -349,37 +478,134 @@
 +		t.Fatal("different account accepted")
 +	}
 +}
++
++func TestPrivateAuthEndpointNormalization(t *testing.T) {
++	path := PrivateAppStoreAPIPathAuth
++	for _, endpoint := range []string{
++		"https://buy.itunes.apple.com" + path,
++		"https://buy.itunes.apple.com" + path + "/",
++		"https://p7-buy.itunes.apple.com:443" + path + "?Pod=7&routing=a%2Fb+c",
++	} {
++		expected, _ := url.Parse(endpoint)
++		normalized, err := normalizePrivateAuthEndpoint(endpoint)
++		if err != nil {
++			t.Fatal(err)
++		}
++		parsed, _ := url.Parse(normalized)
++		if parsed.Path != path+"/" || parsed.Host != expected.Host || parsed.RawQuery != expected.RawQuery || parsed.Scheme != "https" {
++			t.Fatal("routing changed")
++		}
++	}
++	for _, endpoint := range []string{
++		"http://buy.itunes.apple.com" + path,
++		"https://example.com" + path,
++		"https://buy.itunes.apple.com.evil.example" + path,
++		"https://user@buy.itunes.apple.com" + path,
++		"https://buy.itunes.apple.com:8443" + path,
++		"https://buy.itunes.apple.com" + path + "//",
++		"https://buy.itunes.apple.com" + path + "%2f",
++		"https://buy.itunes.apple.com" + path + "/extra",
++		"https://buy.itunes.apple.com" + path + "#fragment",
++	} {
++		if _, err := normalizePrivateAuthEndpoint(endpoint); err == nil {
++			t.Fatal("invalid authentication URL accepted")
++		}
++	}
++}
 --- a/pkg/appstore/appstore_account_info.go
 +++ b/pkg/appstore/appstore_account_info.go
-@@ -22,6 +22,9 @@
- 		return AccountInfoOutput{}, fmt.Errorf("failed to unmarshal json: %w", err)
- 	}
- 
+@@ -24,0 +25,3 @@
 +	if err := validatePrivateAccount(acc.Email); err != nil {
 +		return AccountInfoOutput{}, err
 +	}
- 	return AccountInfoOutput{
- 		Account: acc,
- 	}, nil
+--- a/pkg/appstore/appstore_bag.go
++++ b/pkg/appstore/appstore_bag.go
+@@ -8 +7,0 @@
+-	"strings"
+@@ -54,0 +54,5 @@
++	normalized, err := normalizePrivateAuthEndpoint(config.AuthEndpoint)
++	if err != nil {
++		return BagOutput{}, err
++	}
++	config.AuthEndpoint = normalized
+@@ -114,15 +118,2 @@
+-	parsed, err := url.ParseRequestURI(endpoint)
+-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+-		return fmt.Errorf("invalid authentication endpoint %q", endpoint)
+-	}
+-
+-	host := strings.ToLower(parsed.Hostname())
+-	if host != PrivateAppStoreAPIDomain && !strings.HasSuffix(host, "-buy.itunes.apple.com") {
+-		return fmt.Errorf("unsupported authentication endpoint %q", endpoint)
+-	}
+-
+-	if parsed.Path != PrivateAppStoreAPIPathAuth {
+-		return fmt.Errorf("unsupported authentication endpoint %q", endpoint)
+-	}
+-
+-	return nil
++	_, err := normalizePrivateAuthEndpoint(endpoint)
++	return err
+--- a/pkg/appstore/appstore_bag_test.go
++++ b/pkg/appstore/appstore_bag_test.go
+@@ -180 +180 @@
+-		AuthEndpoint:   testAuthEndpoint,
++		AuthEndpoint:   testAuthEndpoint + "/",
 --- a/pkg/appstore/appstore_login.go
 +++ b/pkg/appstore/appstore_login.go
-@@ -37,6 +37,9 @@
- }
- 
- func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
+@@ -39,0 +40,3 @@
 +	if err := validatePrivateAccount(input.Email); err != nil {
 +		return LoginOutput{}, err
 +	}
- 	macAddr, err := t.machine.MacAddress()
- 	if err != nil {
- 		return LoginOutput{}, fmt.Errorf("failed to get mac address: %w", err)
-@@ -171,6 +174,9 @@
- 		Pod:                 pod,
- 	}
- 
+@@ -109,0 +113,5 @@
++	normalized, normalizeErr := normalizePrivateAuthEndpoint(endpoint)
++	if normalizeErr != nil {
++		return Account{}, normalizeErr
++	}
++	endpoint = normalized
+@@ -173,0 +182,3 @@
 +	if err := validatePrivateAccount(acc.Email); err != nil {
 +		return Account{}, err
 +	}
- 	data, err := json.Marshal(acc)
- 	if err != nil {
- 		return Account{}, fmt.Errorf("failed to marshal json: %w", err)
+@@ -259 +270 @@
+-		} else if err = validateAuthenticationEndpoint(redirect); err != nil {
++		} else if redirect, err = normalizePrivateAuthEndpoint(redirect); err != nil {
+@@ -269 +280 @@
+-		err = NewErrorWithMetadata(errors.New("account is disabled"), res)
++		err = &PrivateAuthenticationResponseError{Code: "account_disabled", HTTPStatus: res.StatusCode}
+@@ -271,5 +282 @@
+-		if res.Data.CustomerMessage != "" {
+-			err = NewErrorWithMetadata(errors.New(res.Data.CustomerMessage), res)
+-		} else {
+-			err = NewErrorWithMetadata(errors.New("something went wrong"), res)
+-		}
++		err = &PrivateAuthenticationResponseError{Code: "authentication_rejected", HTTPStatus: res.StatusCode}
+@@ -277 +284 @@
+-		err = fmt.Errorf("apple returned no usable authentication response (HTTP %d): missing account credentials or unexpected status; try again later or from another network", res.StatusCode)
++		err = &PrivateAuthenticationResponseError{Code: "upstream_response_invalid", HTTPStatus: res.StatusCode}
+--- a/pkg/appstore/appstore_login_test.go
++++ b/pkg/appstore/appstore_login_test.go
+@@ -155 +155 @@
+-						Expect(req.URL).To(Equal(testAuthEndpoint))
++						Expect(req.URL).To(Equal(testAuthEndpoint + "/"))
+@@ -253 +253,3 @@
+-				Expect(err.Error()).To(ContainSubstring("account is disabled"))
++				var responseError *PrivateAuthenticationResponseError
++				Expect(errors.As(err, &responseError)).To(BeTrue())
++				Expect(responseError.Code).To(Equal("account_disabled"))
+@@ -286 +288 @@
+-						Expect(req.URL).To(Equal(testAuthEndpoint))
++						Expect(req.URL).To(Equal(testAuthEndpoint + "/"))
+@@ -299 +301 @@
+-						Expect(req.URL).To(Equal(testRedirectLocation))
++						Expect(req.URL).To(Equal(testRedirectLocation + "/"))
+--- a/pkg/appstore/authentication_retry_test.go
++++ b/pkg/appstore/authentication_retry_test.go
+@@ -152 +152 @@
+-				Expect(request.URL).To(Equal(podURL))
++				Expect(request.URL).To(Equal(podURL + "/"))
+--- a/pkg/http/client.go
++++ b/pkg/http/client.go
+@@ -103 +103 @@
+-				if len(via) > 0 && via[len(via)-1].URL.Path == appStoreAuthPath {
++				if args.Authentication || (len(via) > 0 && (via[len(via)-1].URL.Path == appStoreAuthPath || via[len(via)-1].URL.Path == appStoreAuthPath+"/")) {

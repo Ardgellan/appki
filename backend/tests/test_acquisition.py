@@ -130,6 +130,60 @@ def test_login_normalized_2fa_state_and_raw_errors_not_persisted(setup):
     assert b'SECRET' not in worker.database_path.read_bytes()
 
 
+def test_login_retains_only_safe_diagnostic_across_reopen(setup):
+    worker, registry, runner = setup
+    runner.override = lambda *args: CommandResult(1, json.dumps({
+        'error': 'upstream_http_error', 'stage': 'authentication', 'http_status': 301,
+        'message': 'SECRET-PASSWORD', 'email': 'SECRET-ACCOUNT', 'headers': {'token': 'SECRET-TOKEN'},
+    }))
+    result = worker.login('owner')
+    assert result['status'] == 'requires_auth'
+    assert result['last_error'] == {'code': 'upstream_http_error', 'stage': 'authentication', 'http_status': 301}
+    reopened = AcquisitionWorker(worker.root, registry, runner=runner)
+    assert reopened.profile('owner')['last_error'] == result['last_error']
+    assert b'SECRET' not in worker.database_path.read_bytes()
+    runner.override = None
+    assert reopened.login('owner')['last_error'] is None
+
+
+@pytest.mark.parametrize('payload, expected', [
+    ({'error': 'SECRET', 'stage': 'authentication', 'http_status': 200}, {'code': 'authentication_failed', 'stage': 'unknown'}),
+    ({'error': 'network_timeout', 'stage': 'https://SECRET', 'http_status': 600}, {'code': 'network_timeout', 'stage': 'unknown'}),
+    ({'error': 'network_timeout', 'stage': 'authentication', 'http_status': True}, {'code': 'network_timeout', 'stage': 'authentication'}),
+    ({'error': 'requires_2fa', 'stage': 'verification'}, {'code': 'requires_2fa', 'stage': 'verification'}),
+])
+def test_diagnostic_drops_unknown_fields_and_unbounded_status(setup, payload, expected):
+    worker, _, runner = setup
+    runner.override = lambda *args: CommandResult(1, json.dumps(payload), 'SECRET-STDERR')
+    result = worker.login('owner')
+    assert result['last_error'] == expected
+    assert b'SECRET' not in worker.database_path.read_bytes()
+
+
+@pytest.mark.parametrize('returncode', [-11, 2])
+def test_crashed_adapter_does_not_masquerade_as_credentials_error(setup, returncode):
+    worker, _, runner = setup
+    runner.override = lambda *args: CommandResult(returncode, '', 'PRIVATE CRASH STACK')
+    assert worker.login('owner')['last_error'] == {'code': 'tool_crashed', 'stage': 'runner'}
+    assert b'PRIVATE' not in worker.database_path.read_bytes()
+
+
+def test_existing_private_database_migrates_without_losing_identity(tmp_path):
+    root = tmp_path / 'private'
+    root.mkdir(mode=0o700)
+    database = root / 'acquisition.sqlite3'
+    with sqlite3.connect(database) as db:
+        db.execute('CREATE TABLE profiles (id TEXT PRIMARY KEY,label TEXT NOT NULL,status TEXT NOT NULL,identity_sha256 TEXT,created_at INTEGER NOT NULL)')
+        db.execute('INSERT INTO profiles VALUES (?,?,?,?,?)', ('owner', 'Owner', 'ready', IDENTITY, 123))
+    database.chmod(0o600)
+    registry = ArtifactRegistry(tmp_path / 'shared/registry.json', tmp_path / 'shared')
+    worker = AcquisitionWorker(root, registry, runner=FakeRunner())
+    assert worker.profile('owner')['identity_bound'] is True
+    assert worker.profile('owner')['last_error'] is None
+    with sqlite3.connect(database) as db:
+        assert db.execute('SELECT identity_sha256 FROM profiles WHERE id=?', ('owner',)).fetchone()[0] == IDENTITY
+
+
 def test_account_switch_is_rejected_and_binding_never_changes(setup):
     worker, _, runner = setup
     assert worker.login('owner')['identity_bound'] is True
