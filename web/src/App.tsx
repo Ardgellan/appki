@@ -12,9 +12,9 @@ import {
   api,
   authenticate,
   bindPurchaseRequest,
-  clearPurchaseRequest,
   purchaseRequestId,
 } from "./api";
+import { settlePurchaseOrders } from "./purchase";
 import {
   accessLabel,
   countdown,
@@ -64,7 +64,7 @@ interface AppState {
   authError: string;
   path: string;
   navigate: (path: string) => void;
-  toast: (message: string) => void;
+  toast: (message: string, tone?: "default" | "success") => void;
   orders: Order[];
   ordersLoading: boolean;
   ordersReady: boolean;
@@ -268,7 +268,7 @@ function Navigation() {
         {
           route: "/orders",
           icon: "stack",
-          text: "Приложения",
+          text: "Мои приложения",
           active: path.startsWith("/orders"),
         },
         {
@@ -633,7 +633,7 @@ function CheckoutDialog({
       onClose();
       if (order.status === "succeeded") {
         navigate("/orders");
-        toast("Оплата подтверждена. Приложения доступны для установки.");
+        toast("Оплата прошла! Можно устанавливать.", "success");
       } else {
         navigate(`/payment/${encodeURIComponent(order.id)}`);
         if (
@@ -763,6 +763,24 @@ function PurchasedAppRow({
 }) {
   const now = useServerNow(item.server_now);
   const status = itemAccess(item, now);
+  if (status === "completed")
+    return (
+      <article className="order-row completed-purchase">
+        <div className="completed-app-icon">
+          <AppIcon slug={item.app_slug} title={item.app_title} />
+          <span className="completed-app-check">
+            <Icon name="check" size={12} />
+          </span>
+        </div>
+        <div className="order-row-info">
+          <strong>{item.app_title}</strong>
+          <span className="completed-purchase-title">
+            Приложение установлено!
+          </span>
+          <span>Всё готово к использованию.</span>
+        </div>
+      </article>
+    );
   return (
     <button
       type="button"
@@ -915,6 +933,55 @@ function SecretField({
     </label>
   );
 }
+function FlowInstructions({
+  name,
+  activation = false,
+  credentials = false,
+}: {
+  name: string;
+  activation?: boolean;
+  credentials?: boolean;
+}) {
+  return (
+    <section
+      className="flow-instructions"
+      aria-label={activation ? "Инструкция активации" : "Инструкция установки"}
+    >
+      <ol>
+        {activation ? (
+          <>
+            <li>
+              {credentials
+                ? "Используйте данные для входа ниже."
+                : "Получите в поддержке данные для входа в App Store."}
+            </li>
+            <li>
+              Войдите только в «Контент и покупки». Основной iCloud не меняйте.
+              Если нужен код, запросите его ниже и получите в поддержке.
+            </li>
+            <li>
+              Откройте {name}, затем вернитесь в свой App Store и нажмите
+              «Приложение запустилось».
+            </li>
+          </>
+        ) : (
+          <>
+            <li>Нажмите «Установить приложение».</li>
+            <li>
+              Подтвердите установку в системном окне iPhone. Если оно не
+              появилось, откройте ссылку в Safari.
+            </li>
+            <li>
+              Дождитесь иконки {name} на экране «Домой», затем нажмите
+              «Приложение установлено».
+            </li>
+          </>
+        )}
+      </ol>
+    </section>
+  );
+}
+
 function ActivationPanel({
   order,
   item,
@@ -1069,95 +1136,110 @@ function ActivationPanel({
     }
   }
   return (
-    <div className="surface activation-panel">
-      <h2>Активируйте приложение</h2>
-      {active && <AccessDeadline activation deadline={expiresAt} now={now} />}
-      {suspended ? (
-        <Skeleton />
-      ) : !active ? (
-        <Notice>
-          Время на активацию истекло. Для новой установки оформите отдельную
-          покупку в каталоге.
-        </Notice>
-      ) : (
-        <>
-          {busy && !data ? <Skeleton /> : null}
-          {error && <Notice tone="error">{error}</Notice>}
-          {!data && !busy && (
-            <Button secondary onClick={() => load()}>
-              Обновить доступ
-            </Button>
-          )}
-          {data && (
-            <>
-              <p className="preserve-lines">{data.instructions}</p>
-              {data.mode === "credentials" && (
-                <>
-                  {data.apple_id && (
-                    <SecretField label="Apple Account" value={data.apple_id} />
-                  )}
-                  {data.password && (
-                    <SecretField
-                      label="Пароль"
-                      value={data.password}
-                      password
-                    />
-                  )}
-                  <Notice>
-                    Входите только в App Store («Контент и покупки»). Основной
-                    iCloud менять не нужно. Код подтверждения вводите только в
-                    системном окне Apple.
-                  </Notice>
-                </>
-              )}
-              <Button
-                className="full"
-                secondary
-                busy={busy}
-                disabled={!data.can_request_code || retrySeconds > 0}
-                onClick={requestCode}
-              >
-                {retrySeconds
-                  ? `Новый запрос через ${countdown(retrySeconds).slice(3)}`
-                  : data.code_request?.status === "manual_required"
-                    ? "Запросить новый код"
-                    : "Запросить код"}
+    <>
+      <FlowInstructions
+        name={item.app_title}
+        activation
+        credentials={data?.mode === "credentials"}
+      />
+      <div className="surface activation-panel">
+        <h2>Активируйте приложение</h2>
+        {active && <AccessDeadline activation deadline={expiresAt} now={now} />}
+        {suspended ? (
+          <Skeleton />
+        ) : !active ? (
+          <Notice>
+            Время на активацию истекло. Для новой установки оформите отдельную
+            покупку в каталоге.
+          </Notice>
+        ) : (
+          <>
+            {busy && !data ? <Skeleton /> : null}
+            {error && <Notice tone="error">{error}</Notice>}
+            {!data && !busy && (
+              <Button secondary onClick={() => load()}>
+                Обновить доступ
               </Button>
-              {data.code_request?.status === "manual_required" && (
-                <Notice>
-                  Запрос сохранён. Напишите в поддержку, чтобы получить код.
-                </Notice>
-              )}
-              {support ? (
-                <a
-                  className="button secondary full"
-                  href={support}
-                  target="_blank"
-                  rel="noreferrer"
+            )}
+            {data && (
+              <>
+                {data.instructions.trim() && (
+                  <p className="activation-profile-instructions preserve-lines">
+                    {data.instructions}
+                  </p>
+                )}
+                {data.mode === "credentials" && (
+                  <>
+                    {data.apple_id && (
+                      <SecretField
+                        label="Apple Account"
+                        value={data.apple_id}
+                      />
+                    )}
+                    {data.password && (
+                      <SecretField
+                        label="Пароль"
+                        value={data.password}
+                        password
+                      />
+                    )}
+                    <Notice>
+                      Входите только в App Store («Контент и покупки»). Основной
+                      iCloud менять не нужно. Код подтверждения вводите только в
+                      системном окне Apple.
+                    </Notice>
+                  </>
+                )}
+                <Button
+                  className="full"
+                  secondary
+                  busy={busy}
+                  disabled={!data.can_request_code || retrySeconds > 0}
+                  onClick={requestCode}
                 >
-                  Написать в поддержку <Icon name="external" size={17} />
-                </a>
-              ) : (
+                  {retrySeconds
+                    ? `Новый запрос через ${countdown(retrySeconds).slice(3)}`
+                    : data.code_request?.status === "manual_required"
+                      ? "Запросить новый код"
+                      : "Запросить код"}
+                </Button>
+                {data.code_request?.status === "manual_required" && (
+                  <Notice>
+                    Запрос сохранён. Напишите в поддержку, чтобы получить код.
+                  </Notice>
+                )}
+                {support ? (
+                  <a
+                    className="button secondary full"
+                    href={support}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Написать в поддержку <Icon name="external" size={17} />
+                  </a>
+                ) : (
+                  <p className="muted small-text">
+                    Канал поддержки ещё настраивается.
+                  </p>
+                )}
                 <p className="muted small-text">
-                  Канал поддержки ещё настраивается.
+                  Код передаётся вручную через поддержку. Если он уже не
+                  подходит, запросите новый. Повторный запрос не продлевает
+                  время активации.
                 </p>
-              )}
-              <p className="muted small-text">
-                Код передаётся вручную через поддержку. Если он уже не подходит,
-                запросите новый. Повторный запрос не продлевает время активации.
-              </p>
-              <Button className="full" busy={busy} onClick={complete}>
-                Приложение запустилось <Icon name="check" size={18} />
-              </Button>
-              <p className="muted small-text">
-                Нажмите после успешного запуска. Этот шаг сохраняет вашу отметку
-                о завершении.
-              </p>
-            </>
-          )}
-        </>
-      )}
-    </div>
+                <Button className="full" busy={busy} onClick={complete}>
+                  Приложение запустилось <Icon name="check" size={18} />
+                </Button>
+                <p className="muted small-text">
+                  Нажмите после успешного запуска. Этот шаг сохраняет вашу
+                  отметку о завершении.
+                </p>
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -1200,7 +1282,7 @@ function OrderPage({
         setError("");
         if ((paymentReturn || paymentPage) && fresh.status === "succeeded") {
           navigate("/orders");
-          toast("Оплата подтверждена. Можно устанавливать приложения.");
+          toast("Оплата прошла! Можно устанавливать.", "success");
         }
         setAccessFresh(true);
       } catch (cause) {
@@ -1251,7 +1333,7 @@ function OrderPage({
       recordOrder(next);
       if (next.status === "succeeded") {
         navigate("/orders");
-        toast("Оплата подтверждена. Можно устанавливать приложения.");
+        toast("Оплата прошла! Можно устанавливать.", "success");
       } else if (
         next.status === "pending" &&
         next.has_payment &&
@@ -1270,7 +1352,7 @@ function OrderPage({
           recordOrder(fresh);
           if (fresh.status === "succeeded") {
             navigate("/orders");
-            toast("Оплата подтверждена. Можно устанавливать приложения.");
+            toast("Оплата прошла! Можно устанавливать.", "success");
           }
         } catch {
           /* Keep the original retry error if the status refresh also fails. */
@@ -1347,7 +1429,7 @@ function OrderPage({
     recordOrder(changed);
     if (update.installed) setGrant(null);
     if (update.activated) {
-      toast(`${next.app_title} — активация завершена.`);
+      toast("Всё готово! Приложение установлено и активировано.", "success");
     }
   }
   async function installLink() {
@@ -1479,7 +1561,7 @@ function OrderPage({
                 : order.has_payment && paymentReturn
                   ? "Проверяем результат оплаты"
                   : order.has_payment
-                    ? "Подтвердите оплату"
+                    ? "Ожидаем оплату"
                     : "Создание платежа"}
             </h2>
             {order.requires_payment_review ? (
@@ -1621,21 +1703,11 @@ function OrderPage({
           </Button>
         </div>
       ) : access === "completed" ? (
-        <div className="surface">
+        <div className="surface completion-success">
           <Icon name="check" size={28} />
-          <h2>Всё готово</h2>
-          <p>Вы отметили приложение установленным и активированным.</p>
-          <p>
-            Для другого устройства или новой установки оформите отдельную
-            покупку.
-          </p>
-          <Button
-            className="full"
-            onClick={() =>
-              navigate(`/apps/${encodeURIComponent(selected.app_slug)}`)
-            }
-          >
-            Купить ещё раз <Icon name="arrow" size={18} />
+          <h2>Всё готово! Приложение установлено и активировано.</h2>
+          <Button className="full" onClick={() => navigate("/orders")}>
+            Мои приложения <Icon name="arrow" size={18} />
           </Button>
         </div>
       ) : expired || access === "unavailable" ? (
@@ -1691,44 +1763,47 @@ function OrderPage({
             </button>
           </div>
           {access === "install" ? (
-            <div className="surface installation-panel">
-              <h2>Установите приложение</h2>
-              <AccessDeadline
-                deadline={selected.install_expires_at}
-                now={now}
-              />
-              <p>Подтвердите установку в системном окне на iPhone.</p>
-              <Button className="full" busy={grantBusy} onClick={installLink}>
-                Установить приложение <Icon name="arrow" size={17} />
-              </Button>
-              {hasValidGrant && (
-                <div className="grant">
-                  <p className="muted small-text">
-                    Нет окна установки? Откройте ссылку в Safari.
-                  </p>
-                  <Button className="full" secondary onClick={copyLink}>
-                    Скопировать для Safari <Icon name="copy" size={17} />
-                  </Button>
-                  <p className="muted small-text">
-                    Ссылка действует до {formatTime(grant.expires_at)}. Не
-                    пересылайте её другим людям.
-                  </p>
-                </div>
-              )}
-              {grantError && <Notice tone="error">{grantError}</Notice>}
-              <Button
-                className="full"
-                secondary
-                busy={grantBusy}
-                onClick={installed}
-              >
-                Приложение установлено <Icon name="check" size={18} />
-              </Button>
-              <p className="muted small-text">
-                Нажмите после установки. Ссылка закроется, и начнутся 6 часов на
-                активацию.
-              </p>
-            </div>
+            <>
+              <FlowInstructions name={selected.app_title} />
+              <div className="surface installation-panel">
+                <h2>Установите приложение</h2>
+                <AccessDeadline
+                  deadline={selected.install_expires_at}
+                  now={now}
+                />
+                <p>Подтвердите установку в системном окне на iPhone.</p>
+                <Button className="full" busy={grantBusy} onClick={installLink}>
+                  Установить приложение <Icon name="arrow" size={17} />
+                </Button>
+                {hasValidGrant && (
+                  <div className="grant">
+                    <p className="muted small-text">
+                      Нет окна установки? Откройте ссылку в Safari.
+                    </p>
+                    <Button className="full" secondary onClick={copyLink}>
+                      Скопировать для Safari <Icon name="copy" size={17} />
+                    </Button>
+                    <p className="muted small-text">
+                      Ссылка действует до {formatTime(grant.expires_at)}. Не
+                      пересылайте её другим людям.
+                    </p>
+                  </div>
+                )}
+                {grantError && <Notice tone="error">{grantError}</Notice>}
+                <Button
+                  className="full"
+                  secondary
+                  busy={grantBusy}
+                  onClick={installed}
+                >
+                  Приложение установлено <Icon name="check" size={18} />
+                </Button>
+                <p className="muted small-text">
+                  Нажмите после установки. Ссылка закроется, и начнутся 6 часов
+                  на активацию.
+                </p>
+              </div>
+            </>
           ) : (
             <ActivationPanel
               key={`${order.id}:${selected.app_slug}`}
@@ -1877,6 +1952,16 @@ export default function App() {
     window.location.pathname.replace(/\/$/, "") || "/",
   );
   const [announcement, setAnnouncement] = useState("");
+  const [announcementTone, setAnnouncementTone] = useState<
+    "default" | "success"
+  >("default");
+  const showToast = useCallback(
+    (text: string, tone: "default" | "success" = "default") => {
+      setAnnouncementTone(tone);
+      setAnnouncement(text);
+    },
+    [],
+  );
   const [orders, setOrders] = useState<Order[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersReady, setOrdersReady] = useState(false);
@@ -1913,6 +1998,18 @@ export default function App() {
       /* WebView storage is optional. */
     }
   }, []);
+  const settleOrders = useCallback(
+    (confirmed: Order[]) => {
+      const purchased = settlePurchaseOrders(confirmed).flatMap(
+        (settled) => settled.purchasedSlugs,
+      );
+      if (!purchased.length) return;
+      updateCart(cartRef.current.filter((slug) => !purchased.includes(slug)));
+      navigate("/orders");
+      showToast("Оплата прошла! Можно устанавливать.", "success");
+    },
+    [updateCart, navigate, showToast],
+  );
   const recordOrder = useCallback(
     (order: Order) => {
       orderWrites.current++;
@@ -1925,24 +2022,12 @@ export default function App() {
           (a, b) => b.created_at.localeCompare(a.created_at),
         );
       });
-      const finishedAttempt =
-        order.status !== "pending" &&
-        clearPurchaseRequest(
-          cartRequestKey(
-            orderItems(order).map((item) => item.app_slug),
-            order.test ? "test" : "live",
-          ),
-          order.id,
-        );
-      if (order.status === "succeeded" && finishedAttempt) {
-        const purchased = orderItems(order).map((item) => item.app_slug);
-        updateCart(cartRef.current.filter((slug) => !purchased.includes(slug)));
-      }
+      settleOrders([order]);
     },
-    [updateCart],
+    [settleOrders],
   );
   const refreshOrders = useCallback(async () => {
-    if (!user) return;
+    if (!user || !cartReady) return;
     const owner = user.id;
     const version = orderWrites.current;
     const request = ++ordersRequest.current;
@@ -1992,6 +2077,14 @@ export default function App() {
           b.created_at.localeCompare(a.created_at),
         );
       });
+      settleOrders(
+        incoming.filter(
+          (order) =>
+            userRef.current?.id === owner &&
+            ordersRequest.current === request &&
+            (orderWriteVersions.current.get(order.id) ?? 0) <= version,
+        ),
+      );
       const paid = results[0];
       if (paid.status === "fulfilled") setOrdersReady(true);
       else setOrdersError(message(paid.reason));
@@ -1999,7 +2092,7 @@ export default function App() {
       if (userRef.current?.id === owner && ordersRequest.current === request)
         setOrdersLoading(false);
     }
-  }, [user]);
+  }, [user, cartReady, settleOrders]);
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
@@ -2234,7 +2327,7 @@ export default function App() {
         authError,
         path,
         navigate,
-        toast: setAnnouncement,
+        toast: showToast,
         orders,
         ordersLoading,
         ordersReady,
@@ -2285,7 +2378,10 @@ export default function App() {
           />
         )}
         {announcement && (
-          <div className="toast" role="status">
+          <div
+            className={`toast ${announcementTone === "success" ? "toast-success" : ""}`}
+            role="status"
+          >
             <Icon name="check" size={18} />
             {announcement}
           </div>

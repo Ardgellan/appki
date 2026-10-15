@@ -937,6 +937,59 @@ h1.page-heading {
   margin-left: 2px;
   color: var(--accent);
 }
+.completed-app-icon {
+  position: relative;
+  flex-shrink: 0;
+  padding: 7px;
+  border-radius: 15px;
+  background: #e7f6ee;
+}
+.completed-app-check {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  display: grid;
+  place-items: center;
+  width: 19px;
+  height: 19px;
+  border: 2px solid #e7f6ee;
+  border-radius: 50%;
+  color: #fff;
+  background: #167448;
+}
+.completed-purchase .completed-purchase-title {
+  color: #167448;
+  font-size: 12px;
+  font-weight: 600;
+}
+.flow-instructions {
+  margin: 20px 0;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.flow-instructions ol {
+  margin: 0;
+  padding-left: 21px;
+}
+.flow-instructions li {
+  padding-left: 3px;
+}
+.flow-instructions li + li {
+  margin-top: 10px;
+}
+.activation-panel .activation-profile-instructions {
+  font-size: 12px;
+  line-height: 1.55;
+}
+.surface.completion-success {
+  color: #167448;
+  background: #e7f6ee;
+}
+.completion-success h2,
+.completion-success > p {
+  color: #167448;
+}
 .order-heading,
 .detail-heading,
 .app-heading,
@@ -1436,6 +1489,10 @@ h1.page-heading {
 .toast svg {
   width: 17px;
   height: 17px;
+}
+.toast.toast-success {
+  color: #167448;
+  background: #e7f6ee;
 }
 .spinner {
   display: inline-block;
