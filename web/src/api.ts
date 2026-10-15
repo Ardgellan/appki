@@ -1,6 +1,10 @@
 import type { User } from "./types";
 const SESSION_KEY = "appki.session.v1";
 let token: string | null = null;
+const purchaseAttempts = new Map<
+  string,
+  { id: string; orderId: string | null }
+>();
 export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) {
@@ -99,13 +103,22 @@ export async function authenticate(): Promise<User | null> {
 }
 export function purchaseRequestId(slug: string): string {
   const key = `appki.purchase.${slug}`;
+  const cached = purchaseAttempts.get(slug);
+  if (cached) return cached.id;
   try {
     const existing = sessionStorage.getItem(key);
-    if (existing) return existing;
+    if (existing) {
+      purchaseAttempts.set(slug, {
+        id: existing,
+        orderId: sessionStorage.getItem(`${key}.order`),
+      });
+      return existing;
+    }
   } catch {
     /* Retry in this page is also held in React state. */
   }
   const id = crypto.randomUUID();
+  purchaseAttempts.set(slug, { id, orderId: null });
   try {
     sessionStorage.setItem(key, id);
   } catch {
@@ -113,10 +126,40 @@ export function purchaseRequestId(slug: string): string {
   }
   return id;
 }
-export function clearPurchaseRequest(slug: string) {
+export function bindPurchaseRequest(
+  slug: string,
+  orderId: string,
+  expectedId: string,
+): boolean {
+  let id = purchaseAttempts.get(slug)?.id;
   try {
-    sessionStorage.removeItem(`appki.purchase.${slug}`);
+    id ??= sessionStorage.getItem(`appki.purchase.${slug}`) ?? undefined;
+  } catch {
+    /* The in-memory attempt is sufficient when storage is unavailable. */
+  }
+  if (id !== expectedId) return false;
+  purchaseAttempts.set(slug, { id, orderId });
+  try {
+    sessionStorage.setItem(`appki.purchase.${slug}.order`, orderId);
+  } catch {
+    /* The current page retains the attempt when storage is unavailable. */
+  }
+  return true;
+}
+export function clearPurchaseRequest(slug: string, orderId?: string): boolean {
+  let boundOrder = purchaseAttempts.get(slug)?.orderId;
+  try {
+    boundOrder ??= sessionStorage.getItem(`appki.purchase.${slug}.order`);
   } catch {
     /* Optional persistence. */
   }
+  if (orderId !== undefined && boundOrder !== orderId) return false;
+  purchaseAttempts.delete(slug);
+  try {
+    sessionStorage.removeItem(`appki.purchase.${slug}`);
+    sessionStorage.removeItem(`appki.purchase.${slug}.order`);
+  } catch {
+    /* Optional persistence. */
+  }
+  return true;
 }

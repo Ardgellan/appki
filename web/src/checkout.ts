@@ -43,6 +43,12 @@ export function orderItems(order: Order): OrderItem[] {
           installed: false,
           activated: false,
           can_install: order.can_install,
+          can_activate: false,
+          can_request_code: false,
+          server_now: "",
+          install_expires_at: null,
+          activation_expires_at: null,
+          access_status: "unavailable",
         },
       ];
 }
@@ -67,7 +73,7 @@ export interface PurchasedApp {
 }
 
 export function purchasedApps(orders: Order[], mode: string): PurchasedApp[] {
-  const result = new Map<string, PurchasedApp>();
+  const result: PurchasedApp[] = [];
   const sorted = [...orders].sort((a, b) =>
     b.created_at.localeCompare(a.created_at),
   );
@@ -75,11 +81,10 @@ export function purchasedApps(orders: Order[], mode: string): PurchasedApp[] {
     if (order.status !== "succeeded" || order.test !== (mode === "test"))
       continue;
     for (const item of orderItems(order)) {
-      if (!result.has(item.app_slug))
-        result.set(item.app_slug, { order, item });
+      result.push({ order, item });
     }
   }
-  return [...result.values()];
+  return result;
 }
 
 export function routeForItem(orderId: string, slug: string): string {

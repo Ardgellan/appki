@@ -30,6 +30,11 @@ def iso(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat().replace('+00:00', 'Z') if value is not None else None
 
 
+INSTALL_WINDOW_SECONDS = 12 * 3600
+ACTIVATION_WINDOW_SECONDS = 6 * 3600
+CODE_REQUEST_COOLDOWN_SECONDS = 60
+
+
 class AuthBody(BaseModel):
     init_data: str = Field(min_length=1, max_length=16384)
 
@@ -64,8 +69,6 @@ class ItemStateBody(BaseModel):
     def valid_update(self):
         if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
             raise ValueError('Specify installation or activation state')
-        if self.installed is False and self.activated is True:
-            raise ValueError('Activation requires installation')
         return self
 
 
@@ -265,6 +268,62 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
             return [dict(row) for row in conn.execute(
                 'SELECT * FROM order_items WHERE order_id=? ORDER BY app_slug', (order_id,)).fetchall()]
 
+    def delivery_window(item, order, *, now=None):
+        now = int(time.time()) if now is None else now
+        paid = order['status'] == 'succeeded'
+        install_expires = ((order['paid_at'] if order['paid_at'] is not None else order['created_at']) +
+                           INSTALL_WINDOW_SECONDS) if paid else None
+        activation_expires = (item['installed_at'] + ACTIVATION_WINDOW_SECONDS
+                              if item['installed_at'] is not None else None)
+        if not paid or bool(order['test']) != (cfg.yookassa_mode == 'test'):
+            status = 'unavailable'
+        elif item['activated_at'] is not None:
+            status = 'completed'
+        elif activation_expires is not None:
+            status = 'activate' if now < activation_expires else 'activation_expired'
+        else:
+            status = 'install' if now < install_expires else 'install_expired'
+        return {'server_now': iso(now), 'install_expires_at': iso(install_expires),
+                'activation_expires_at': iso(activation_expires), 'access_status': status}
+
+    def require_delivery(item, order, phase, *, now=None):
+        window = delivery_window(item, order, now=now)
+        status = window['access_status']
+        if status == 'unavailable':
+            raise HTTPException(403, 'Доступ к заказу закрыт.')
+        if status == 'completed':
+            raise HTTPException(409, 'Активация завершена. Для другого устройства оформите новую покупку.')
+        if phase == 'install':
+            if item['installed_at'] is not None:
+                raise HTTPException(409, 'Установка уже отмечена. Перейдите к активации или оформите новую покупку.')
+            if status == 'install_expired':
+                raise HTTPException(410, '12 часов на установку истекли. Оформите новую покупку.')
+        else:
+            if status == 'install_expired':
+                raise HTTPException(410, '12 часов на установку истекли. Оформите новую покупку.')
+            if item['installed_at'] is None:
+                raise HTTPException(409, 'Сначала отметьте установку приложения.')
+            if status == 'activation_expired':
+                raise HTTPException(410, '6 часов на активацию истекли. Обратитесь в поддержку.')
+        return window
+
+    def code_request_metadata(item, *, now=None, conn=None):
+        now = int(time.time()) if now is None else now
+        query = '''SELECT id,requested_at FROM activation_code_requests
+                   WHERE order_id=? AND app_slug=? ORDER BY requested_at DESC,id DESC LIMIT 1'''
+        if conn is None:
+            with db.connection() as connection:
+                row = connection.execute(query, (item['order_id'], item['app_slug'])).fetchone()
+        else:
+            row = conn.execute(query, (item['order_id'], item['app_slug'])).fetchone()
+        retry_at = row['requested_at'] + CODE_REQUEST_COOLDOWN_SECONDS if row is not None else None
+        return {'id': row['id'] if row is not None else None,
+                'status': 'manual_required' if row is not None else 'not_requested',
+                'requested_at': iso(row['requested_at']) if row is not None else None,
+                'retry_at': iso(retry_at), 'retry_after': max(0, retry_at - now) if retry_at else 0,
+                'expires_at': iso(item['installed_at'] + ACTIVATION_WINDOW_SECONDS)
+                              if item['installed_at'] is not None else None}
+
     def item_view(item, order):
         if item.get('artifact_id'):
             record, _ = artifact_snapshot(item['artifact_id'])
@@ -272,13 +331,17 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         else:
             product = current_products().get(item['app_slug'])
             app_file = (product.get('ipa') if product is not None and not product.get('coming_soon', False) else None)
+        window = delivery_window(item, order)
+        can_install = window['access_status'] == 'install' and app_file is not None and app_file.available
+        if window['access_status'] == 'install' and not can_install:
+            window['access_status'] = 'unavailable'
+        can_activate = window['access_status'] == 'activate'
         return {'app_slug': item['app_slug'], 'app_title': item['app_title'],
                 'amount_rub': item['amount_rub'], 'installed': item['installed_at'] is not None,
                 'activated': item['activated_at'] is not None,
                 'installed_at': iso(item['installed_at']), 'activated_at': iso(item['activated_at']),
-                'can_install': (order['status'] == 'succeeded' and
-                                bool(order['test']) == (cfg.yookassa_mode == 'test') and
-                                app_file is not None and app_file.available)}
+                **window, 'can_install': can_install, 'can_activate': can_activate,
+                'can_request_code': can_activate and code_request_metadata(item)['retry_after'] == 0}
 
     def owned_order(order_id, user_id):
         with db.connection() as conn:
@@ -366,8 +429,9 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
             raise HTTPException(404, 'Приложение в заказе не найдено.')
         return row, item
 
-    def pin_item_artifact(order_id, user_id, app_slug=None):
-        _, item = paid_item(order_id, user_id, app_slug)
+    def pin_item_artifact(order_id, user_id, app_slug=None, *, phase):
+        order, item = paid_item(order_id, user_id, app_slug)
+        require_delivery(item, order, phase)
         selected, selected_legacy = None, False
         if not item['artifact_id']:
             product = current_products().get(item['app_slug'])
@@ -387,6 +451,7 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
                 raise HTTPException(403, 'Доступ к заказу закрыт.')
             item = dict(conn.execute('SELECT * FROM order_items WHERE order_id=? AND app_slug=?',
                                      (order_id, item['app_slug'])).fetchone())
+            require_delivery(item, order, phase)
             if item['artifact_id']:
                 record, is_legacy = artifact_snapshot(item['artifact_id'], conn)
             else:
@@ -647,22 +712,25 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         return order_view(row)
 
     def issue_install_link(order_id, user_id, app_slug=None):
-        item, record, _ = pin_item_artifact(order_id, user_id, app_slug)
+        item, record, _ = pin_item_artifact(order_id, user_id, app_slug, phase='install')
         app_file = artifact_file(record)
         if not app_file.refresh():
             raise HTTPException(503, 'Файл приложения временно недоступен.')
         rate_limit(('grants', user_id), 20)
         token = secrets.token_hex(32)
-        expires = int(time.time()) + cfg.install_ttl_seconds
         with db.connection(write=True) as conn:
             # Check payment again inside the same transaction as capability creation.
-            row = conn.execute('SELECT status,test FROM orders WHERE id=? AND user_id=?', (order_id, user_id)).fetchone()
+            row = conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?', (order_id, user_id)).fetchone()
             if row is None or row['status'] != 'succeeded' or bool(row['test']) != (cfg.yookassa_mode == 'test'):
                 raise HTTPException(403, 'Доступ к заказу закрыт.')
-            pinned = conn.execute('SELECT artifact_id FROM order_items WHERE order_id=? AND app_slug=?',
+            pinned = conn.execute('SELECT * FROM order_items WHERE order_id=? AND app_slug=?',
                                   (order_id, item['app_slug'])).fetchone()
             if pinned is None or pinned['artifact_id'] != record['id']:
                 raise HTTPException(403, 'Доступ к установке закрыт.')
+            now = int(time.time())
+            require_delivery(pinned, row, 'install', now=now)
+            expires = min(now + cfg.install_ttl_seconds,
+                          (row['paid_at'] if row['paid_at'] is not None else row['created_at']) + INSTALL_WINDOW_SECONDS)
             conn.execute('''INSERT INTO install_grants (token_hash,order_id,expires_at,revoked,app_slug,artifact_id)
                 VALUES (?,?,?,0,?,?)''', (token_hash(token), order_id, expires, item['app_slug'], record['id']))
             conn.execute('DELETE FROM install_grants WHERE expires_at<=?', (int(time.time()),))
@@ -677,11 +745,19 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         return issue_install_link(order_id, user['id'], app_slug)
 
     def activation_for_item(order_id, user_id, app_slug=None):
-        _, record, is_legacy = pin_item_artifact(order_id, user_id, app_slug)
+        item, record, is_legacy = pin_item_artifact(order_id, user_id, app_slug, phase='activate')
         # Validate cached identity/provenance too, even when returning only an
         # activation instruction rather than opening a download stream.
         artifact_file(record)
-        return activation_profile(record, is_legacy)
+        profile = activation_profile(record, is_legacy)
+        # Recheck after reading operator configuration: completion/expiry must
+        # close credential delivery too, not merely hide a frontend button.
+        order, item = paid_item(order_id, user_id, item['app_slug'])
+        window = require_delivery(item, order, 'activate')
+        request = code_request_metadata(item)
+        return {**profile, 'server_now': window['server_now'],
+                'activation_expires_at': window['activation_expires_at'],
+                'can_request_code': request['retry_after'] == 0, 'code_request': request}
 
     @app.get('/api/orders/{order_id}/activation')
     def activation(order_id: str, user=Depends(current_user)):
@@ -691,10 +767,51 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
     def item_activation(order_id: str, app_slug: str, user=Depends(current_user)):
         return activation_for_item(order_id, user['id'], app_slug)
 
+    def request_activation_code(order_id, user_id, app_slug=None):
+        item, record, _ = pin_item_artifact(order_id, user_id, app_slug, phase='activate')
+        artifact_file(record)
+        with db.connection(write=True) as conn:
+            order = conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?', (order_id, user_id)).fetchone()
+            if order is None:
+                raise HTTPException(404, 'Заказ не найден.')
+            item = dict(conn.execute('SELECT * FROM order_items WHERE order_id=? AND app_slug=?',
+                                     (order_id, item['app_slug'])).fetchone())
+            now = int(time.time())
+            window = require_delivery(item, order, 'activate', now=now)
+            request = code_request_metadata(item, now=now, conn=conn)
+            if request['retry_after'] == 0:
+                # Metadata records an explicit request for manual support. There
+                # is no collector, code value, or claim that Apple sent a code.
+                conn.execute('INSERT INTO activation_code_requests VALUES (?,?,?,?)',
+                             (str(uuid.uuid4()), order_id, item['app_slug'], now))
+                request = code_request_metadata(item, now=now, conn=conn)
+        return {'server_now': window['server_now'], 'activation_expires_at': window['activation_expires_at'],
+                'can_request_code': request['retry_after'] == 0, 'code_request': request}
+
+    @app.post('/api/orders/{order_id}/activation/code-request')
+    def activation_code_request(order_id: str, user=Depends(current_user)):
+        return request_activation_code(order_id, user['id'])
+
+    @app.post('/api/orders/{order_id}/items/{app_slug}/activation/code-request')
+    def item_activation_code_request(order_id: str, app_slug: str, user=Depends(current_user)):
+        return request_activation_code(order_id, user['id'], app_slug)
+
     @app.patch('/api/orders/{order_id}/items/{app_slug}/state')
     def item_state(order_id: str, app_slug: str, body: ItemStateBody, user=Depends(current_user)):
-        paid_item(order_id, user['id'], app_slug)
-        now = int(time.time())
+        _, before = paid_item(order_id, user['id'], app_slug)
+        if body.installed is False or body.activated is False:
+            raise HTTPException(409, 'Отметки установки и активации нельзя сбросить. Для другого устройства оформите новую покупку.')
+        if body.installed is True and before['installed_at'] is None:
+            try:
+                pin_item_artifact(order_id, user['id'], app_slug, phase='install')
+            except HTTPException as exc:
+                # Another identical request may have completed the first mark
+                # between our read and artifact pin. Preserve true idempotence.
+                if exc.status_code != 409:
+                    raise
+                _, latest = paid_item(order_id, user['id'], app_slug)
+                if latest['installed_at'] is None:
+                    raise
         with db.connection(write=True) as conn:
             row = conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?', (order_id, user['id'])).fetchone()
             if row is None:
@@ -705,17 +822,18 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
                                 (order_id, app_slug)).fetchone()
             if item is None:
                 raise HTTPException(404, 'Приложение в заказе не найдено.')
+            now = int(time.time())
             installed_at, activated_at = item['installed_at'], item['activated_at']
-            if body.installed is True:
-                installed_at = installed_at if installed_at is not None else now
-            elif body.installed is False:
-                installed_at, activated_at = None, None
-            if body.activated is True:
+            if body.installed is True and installed_at is None:
+                require_delivery(item, row, 'install', now=now)
+                installed_at = now
+                conn.execute('UPDATE install_grants SET revoked=1 WHERE order_id=? AND app_slug=?',
+                             (order_id, app_slug))
+            if body.activated is True and activated_at is None:
                 if installed_at is None:
                     raise HTTPException(409, 'Сначала отметьте установку приложения.')
-                activated_at = activated_at if activated_at is not None else now
-            elif body.activated is False:
-                activated_at = None
+                require_delivery({**dict(item), 'installed_at': installed_at}, row, 'activate', now=now)
+                activated_at = now
             # These are the owner's reported UI steps, not confirmation from Apple.
             conn.execute('UPDATE order_items SET installed_at=?,activated_at=? WHERE order_id=? AND app_slug=?',
                          (installed_at, activated_at, order_id, app_slug))
@@ -762,15 +880,17 @@ def create_app(settings: Settings | None = None, *, payment_client=None, catalog
         if request.url.query or not re.fullmatch('[0-9a-f]{64}', token):
             raise HTTPException(404, 'Ссылка не найдена.')
         with db.connection() as conn:
-            row = conn.execute('''SELECT g.expires_at,g.revoked,g.app_slug,g.artifact_id,g.order_id,o.status,o.test FROM install_grants g
+            row = conn.execute('''SELECT g.expires_at,g.revoked,g.app_slug,g.artifact_id,g.order_id,
+                o.status,o.test,o.paid_at,o.created_at,i.installed_at,i.activated_at FROM install_grants g
                 JOIN orders o ON o.id=g.order_id
                 JOIN order_items i ON i.order_id=g.order_id AND i.app_slug=g.app_slug
                 WHERE g.token_hash=?''', (token_hash(token),)).fetchone()
         if row is None:
             raise HTTPException(404, 'Ссылка не найдена.')
         if (row['expires_at'] <= int(time.time()) or row['revoked'] or row['status'] != 'succeeded'
-                or bool(row['test']) != (cfg.yookassa_mode == 'test')):
-            raise HTTPException(410, 'Ссылка истекла. Получите новую в своём заказе.')
+                or bool(row['test']) != (cfg.yookassa_mode == 'test')
+                or delivery_window(row, row)['access_status'] != 'install'):
+            raise HTTPException(410, 'Доступ по ссылке установки закрыт. Проверьте срок и статус покупки.')
         if row['artifact_id']:
             record, _ = artifact_snapshot(row['artifact_id'])
         else:

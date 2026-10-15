@@ -93,6 +93,12 @@ test("legacy orders retain installation access without inventing activation", ()
     installed: false,
     activated: false,
     can_install: true,
+    can_activate: false,
+    can_request_code: false,
+    server_now: "",
+    install_expires_at: null,
+    activation_expires_at: null,
+    access_status: "unavailable",
   });
 });
 
@@ -105,6 +111,12 @@ test("my apps only includes verified paid orders in the current payment mode", (
       installed: true,
       activated: true,
       can_install: true,
+      can_activate: false,
+      can_request_code: false,
+      server_now: "2026-10-13T12:00:00Z",
+      install_expires_at: "2026-10-14T00:00:00Z",
+      activation_expires_at: null,
+      access_status: "completed" as const,
     },
     {
       app_slug: "v2ray",
@@ -113,6 +125,12 @@ test("my apps only includes verified paid orders in the current payment mode", (
       installed: false,
       activated: false,
       can_install: true,
+      can_activate: false,
+      can_request_code: false,
+      server_now: "2026-10-13T12:00:00Z",
+      install_expires_at: "2026-10-14T00:00:00Z",
+      activation_expires_at: null,
+      access_status: "install" as const,
     },
   ];
   const old = order({ id: "old", created_at: "2026-10-12T12:00:00Z" });
@@ -121,9 +139,10 @@ test("my apps only includes verified paid orders in the current payment mode", (
   const refunded = order({ id: "refunded", status: "refunded" });
   const live = order({ id: "live", test: false });
   const owned = purchasedApps([old, pending, newer, refunded, live], "test");
-  assert.equal(owned.length, 2);
+  assert.equal(owned.length, 3);
   assert.equal(owned[0].order.id, "new");
   assert.equal(owned[0].item.activated, true);
+  assert.equal(owned[2].order.id, "old");
   assert.equal(
     purchasedApps([old, pending, newer, refunded, live], "live")[0].order.id,
     "live",

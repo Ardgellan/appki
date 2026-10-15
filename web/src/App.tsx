@@ -11,9 +11,19 @@ import {
   ApiError,
   api,
   authenticate,
+  bindPurchaseRequest,
   clearPurchaseRequest,
   purchaseRequestId,
 } from "./api";
+import {
+  accessLabel,
+  countdown,
+  itemAccess,
+  remainingSeconds,
+  serverClock,
+  serverTime,
+  synchronizeClock,
+} from "./access";
 import {
   appCount,
   canPurchaseApp,
@@ -27,6 +37,7 @@ import type { PurchasableApp } from "./checkout";
 import { AppIcon, BrandMark, Icon } from "./icons";
 import type {
   Activation,
+  ActivationRequestState,
   AppInfo,
   Config,
   Grant,
@@ -36,6 +47,7 @@ import type {
 } from "./types";
 import {
   fileSize,
+  formatDate,
   formatTime,
   httpsURL,
   orderStatus,
@@ -68,6 +80,49 @@ const Context = createContext<AppState>(null!);
 const useApp = () => useContext(Context);
 const message = (error: unknown) =>
   error instanceof Error ? error.message : "Не получилось. Попробуйте ещё раз.";
+
+function useServerNow(serverNow: string): number {
+  const clock = useRef(serverClock(serverNow, performance.now()));
+  const lastSource = useRef(serverNow);
+  if (lastSource.current !== serverNow) {
+    clock.current = synchronizeClock(
+      clock.current,
+      serverNow,
+      performance.now(),
+    );
+    lastSource.current = serverNow;
+  }
+  const [tick, setTick] = useState(() => performance.now());
+  useEffect(() => {
+    const update = () => setTick(performance.now());
+    const timer = window.setInterval(update, 1000);
+    window.addEventListener("focus", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, []);
+  return serverTime(clock.current, tick);
+}
+
+function AccessDeadline({
+  deadline,
+  now,
+  activation = false,
+}: {
+  deadline: string | null;
+  now: number;
+  activation?: boolean;
+}) {
+  return (
+    <p className="access-deadline">
+      {activation ? "На активацию осталось" : "На установку осталось"}
+      <strong>{countdown(remainingSeconds(deadline, now))}</strong>
+    </p>
+  );
+}
 
 function external(value: string) {
   const url = httpsURL(value);
@@ -281,24 +336,13 @@ function Specs({ app }: { app: AppInfo }) {
   );
 }
 function Catalog() {
-  const {
-    apps,
-    cart,
-    cartReady,
-    orders,
-    config,
-    toggleCart,
-    checkout,
-    navigate,
-    path,
-  } = useApp();
+  const { apps, cart, cartReady, toggleCart, checkout, path } = useApp();
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("Все");
   const [expanded, setExpanded] = useState<string | null>(null);
   useEffect(() => {
     if (path.startsWith("/apps/")) setExpanded(routePart(path.slice(6)));
   }, [path]);
-  const owned = purchasedApps(orders, config?.payments_mode ?? "test");
   const categories = ["Все", ...new Set(apps.map((app) => app.category))];
   const filtered = apps.filter(
     (app) =>
@@ -338,9 +382,6 @@ function Catalog() {
       <div className="app-list">
         {filtered.map((app) => {
           const selected = cart.includes(app.slug);
-          const purchase = owned.find(
-            (entry) => entry.item.app_slug === app.slug,
-          );
           const open = expanded === app.slug;
           return (
             <article className="app-card" key={app.slug} data-expanded={open}>
@@ -368,16 +409,9 @@ function Catalog() {
                     <button
                       type="button"
                       className="cart-toggle"
-                      aria-label={
-                        purchase
-                          ? `${app.title} уже приобретено`
-                          : `${selected ? "Убрать" : "Добавить"} ${app.title} ${selected ? "из корзины" : "в корзину"}`
-                      }
+                      aria-label={`${selected ? "Убрать" : "Добавить"} ${app.title} ${selected ? "из корзины" : "в корзину"}`}
                       aria-pressed={selected}
-                      data-owned={Boolean(purchase)}
-                      disabled={
-                        !cartReady || !canPurchaseApp(app) || Boolean(purchase)
-                      }
+                      disabled={!cartReady || !canPurchaseApp(app)}
                       onClick={() => toggleCart(app.slug)}
                     >
                       <Icon name="basket" size={10.5} />
@@ -420,29 +454,21 @@ function Catalog() {
                         <button
                           type="button"
                           className="button card-cta"
-                          disabled={
-                            (!canPurchaseApp(app) || !cartReady) && !purchase
-                          }
+                          disabled={!canPurchaseApp(app) || !cartReady}
                           onClick={(event) =>
-                            purchase
-                              ? navigate(
-                                  routeForItem(purchase.order.id, app.slug),
-                                )
-                              : selected
-                                ? checkout(event.currentTarget)
-                                : toggleCart(app.slug)
+                            selected
+                              ? checkout(event.currentTarget)
+                              : toggleCart(app.slug)
                           }
                         >
-                          {purchase
-                            ? "Открыть в моих приложениях"
-                            : !canPurchaseApp(app)
-                              ? "Временно недоступно"
-                              : selected
-                                ? "Перейти к оплате"
-                                : "Добавить в корзину"}
+                          {!canPurchaseApp(app)
+                            ? "Временно недоступно"
+                            : selected
+                              ? "Перейти к оплате"
+                              : "Добавить в корзину"}
                           <Icon
-                            name={selected || purchase ? "arrow" : "basket"}
-                            size={selected || purchase ? 17 : 10.5}
+                            name={selected ? "arrow" : "basket"}
+                            size={selected ? 17 : 10.5}
                           />
                         </button>
                       </>
@@ -472,7 +498,9 @@ function InstallationInstructions() {
         <p>
           После оплаты откройте «Мои приложения», выберите приложение и нажмите
           «Установить». Подтвердите установку на iPhone. Если окно не появилось,
-          откройте установочную ссылку в Safari.
+          откройте установочную ссылку в Safari. На установку даётся 12 часов с
+          момента оплаты. После установки нажмите «Приложение установлено»:
+          установочная ссылка закроется и начнётся активация.
         </p>
       </section>
       <section>
@@ -481,7 +509,9 @@ function InstallationInstructions() {
           Для первого запуска может понадобиться авторизация установочного Apple
           Account. Инструкция и помощь доступны в оплаченном заказе. Вход
           выполняется только в App Store или «Контент и покупки», без выхода из
-          основного iCloud.
+          основного iCloud. На активацию даётся 6 часов после отметки об
+          установке. Запросите код и напишите в поддержку — сейчас код
+          передаётся вручную. Если код уже не подходит, запросите новый.
         </p>
       </section>
       <section>
@@ -489,8 +519,9 @@ function InstallationInstructions() {
         <p>
           После успешного запуска вернитесь в свой аккаунт App Store. Установка
           не переносит приложение в покупки вашего Apple Account. Подписки
-          сторонних сервисов и VPN-серверы приобретаются отдельно. Перед
-          переустановкой сохраните настройки существующей копии.
+          сторонних сервисов и VPN-серверы приобретаются отдельно. Одна покупка
+          рассчитана на одну установку. Для другого устройства или новой
+          установки оформите отдельную покупку в каталоге.
         </p>
       </section>
     </div>
@@ -519,7 +550,6 @@ function CheckoutDialog({
   const {
     config,
     user,
-    orders,
     ordersReady,
     ordersError,
     refreshOrders,
@@ -527,19 +557,19 @@ function CheckoutDialog({
     navigate,
     toast,
   } = useApp();
-  const alreadyOwned = selection.some((app) =>
-    purchasedApps(orders, config?.payments_mode ?? "test").some(
-      (entry) => entry.item.app_slug === app.slug,
-    ),
-  );
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const sheet = useRef<HTMLElement>(null);
   const close = useRef<HTMLButtonElement>(null);
   const locked = useRef(false);
+  const mounted = useRef(true);
   useEffect(() => {
+    mounted.current = true;
     close.current?.focus();
+    return () => {
+      mounted.current = false;
+    };
   }, []);
   useEffect(() => {
     setConfirmed(false);
@@ -574,7 +604,6 @@ function CheckoutDialog({
   async function pay() {
     if (
       !selection.length ||
-      alreadyOwned ||
       !ordersReady ||
       ordersError ||
       !confirmed ||
@@ -587,18 +616,20 @@ function CheckoutDialog({
     setBusy(true);
     setError("");
     const slugs = selection.map((app) => app.slug);
+    const requestKey = cartRequestKey(slugs, config.payments_mode);
+    const requestId = purchaseRequestId(requestKey);
     try {
       const order = await api<Order>("/orders", {
         method: "POST",
         body: JSON.stringify({
           app_slugs: slugs,
           expected_amount_rub: cartAmount(selection),
-          request_id: purchaseRequestId(
-            cartRequestKey(slugs, config.payments_mode),
-          ),
+          request_id: requestId,
         }),
       });
+      bindPurchaseRequest(requestKey, order.id, requestId);
       recordOrder(order);
+      if (!mounted.current) return;
       onClose();
       if (order.status === "succeeded") {
         navigate("/orders");
@@ -614,6 +645,7 @@ function CheckoutDialog({
           external(order.payment_url);
       }
     } catch (cause) {
+      if (!mounted.current) return;
       setError(message(cause));
       setConfirmed(false);
       await reloadCatalog();
@@ -688,9 +720,6 @@ function CheckoutDialog({
                 </Button>
               </>
             )}
-            {alreadyOwned && (
-              <Notice>Приложение уже доступно в «Моих приложениях».</Notice>
-            )}
             <label className="checkout-confirm">
               <input
                 type="checkbox"
@@ -704,7 +733,6 @@ function CheckoutDialog({
               className="full"
               disabled={
                 !selection.length ||
-                alreadyOwned ||
                 !ordersReady ||
                 Boolean(ordersError) ||
                 !confirmed ||
@@ -724,6 +752,51 @@ function CheckoutDialog({
   );
 }
 
+function PurchasedAppRow({
+  order,
+  item,
+  navigate,
+}: {
+  order: Order;
+  item: OrderItem;
+  navigate: (path: string) => void;
+}) {
+  const now = useServerNow(item.server_now);
+  const status = itemAccess(item, now);
+  return (
+    <button
+      type="button"
+      className="order-row"
+      aria-label={`Открыть ${item.app_title}, покупка ${formatDate(order.paid_at || order.created_at)}`}
+      onClick={() => navigate(routeForItem(order.id, item.app_slug))}
+    >
+      <AppIcon slug={item.app_slug} title={item.app_title} />
+      <div className="order-row-info">
+        <strong>{item.app_title}</strong>
+        <span>{accessLabel(status)}</span>
+        <span>
+          Покупка {formatDate(order.paid_at || order.created_at)},{" "}
+          {formatTime(order.paid_at || order.created_at)}
+        </span>
+        {(status === "install" || status === "activate") && (
+          <span>
+            Осталось{" "}
+            {countdown(
+              remainingSeconds(
+                status === "install"
+                  ? item.install_expires_at
+                  : item.activation_expires_at,
+                now,
+              ),
+            )}
+          </span>
+        )}
+      </div>
+      <Icon name="chevronRight" size={18} />
+    </button>
+  );
+}
+
 function Orders() {
   const {
     user,
@@ -737,13 +810,24 @@ function Orders() {
   } = useApp();
   useEffect(() => {
     void refreshOrders();
+    const refresh = () => {
+      if (document.visibilityState === "visible") void refreshOrders();
+    };
+    const timer = window.setInterval(refresh, 30000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
   }, [refreshOrders]);
   const owned = purchasedApps(orders, config?.payments_mode ?? "test");
   return (
     <section>
       <div className="page-heading">
         <h1>Мои приложения</h1>
-        <p>Ваши приложения и доступ к установке.</p>
+        <p>Каждая покупка — отдельная установка и активация.</p>
       </div>
       {!authReady || (user && ordersLoading && !orders.length) ? (
         <Skeleton />
@@ -761,26 +845,12 @@ function Orders() {
           )}
           <div className="orders-list">
             {owned.map(({ order, item }) => (
-              <button
-                type="button"
-                className="order-row"
-                key={item.app_slug}
-                aria-label={`Открыть ${item.app_title}`}
-                onClick={() => navigate(routeForItem(order.id, item.app_slug))}
-              >
-                <AppIcon slug={item.app_slug} title={item.app_title} />
-                <div className="order-row-info">
-                  <strong>{item.app_title}</strong>
-                  <span>
-                    {item.activated
-                      ? "Активировано"
-                      : item.installed
-                        ? "Нужна активация"
-                        : "Установить и активировать"}
-                  </span>
-                </div>
-                <Icon name="chevronRight" size={18} />
-              </button>
+              <PurchasedAppRow
+                key={`${order.id}:${item.app_slug}`}
+                order={order}
+                item={item}
+                navigate={navigate}
+              />
             ))}
           </div>
           {!owned.length && !ordersError && (
@@ -849,98 +919,242 @@ function ActivationPanel({
   order,
   item,
   onComplete,
+  onRefresh,
 }: {
   order: Order;
   item: OrderItem;
   onComplete: () => Promise<void>;
+  onRefresh: () => Promise<void>;
 }) {
   const { config } = useApp();
   const [data, setData] = useState<Activation | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const load = useCallback(async () => {
+  const [suspended, setSuspended] = useState(false);
+  const request = useRef(0);
+  const locked = useRef(false);
+  const expiredRefresh = useRef(false);
+  const retryRefresh = useRef<string | null>(null);
+  const path = `/orders/${encodeURIComponent(order.id)}/items/${encodeURIComponent(item.app_slug)}/activation`;
+  const load = useCallback(
+    async (quiet = false) => {
+      if (locked.current) return;
+      locked.current = true;
+      const version = ++request.current;
+      setBusy(true);
+      if (!quiet) setData(null);
+      setError("");
+      try {
+        const fresh = await api<Activation>(path);
+        if (request.current !== version) return;
+        setData(fresh);
+        setSuspended(false);
+      } catch (cause) {
+        if (request.current !== version) return;
+        setError(message(cause));
+        if (
+          cause instanceof ApiError &&
+          (cause.status === 403 || cause.status === 409 || cause.status === 410)
+        ) {
+          setData(null);
+          void onRefresh();
+        }
+      } finally {
+        locked.current = false;
+        if (request.current === version) setBusy(false);
+      }
+    },
+    [path, onRefresh],
+  );
+  useEffect(() => {
+    void load();
+    const refresh = () => {
+      if (document.visibilityState === "visible") void load();
+      else {
+        request.current++;
+        setSuspended(true);
+        setData(null);
+      }
+    };
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void load(true);
+    }, 15000);
+    document.addEventListener("visibilitychange", refresh);
+    window.addEventListener("focus", refresh);
+    return () => {
+      request.current++;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", refresh);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [load]);
+  const now = useServerNow(data?.server_now || item.server_now);
+  const expiresAt = data?.activation_expires_at || item.activation_expires_at;
+  const remaining = remainingSeconds(expiresAt, now);
+  const active = !suspended && item.can_activate && remaining > 0;
+  const retrySeconds = remainingSeconds(
+    data?.code_request?.retry_at || null,
+    now,
+  );
+  useEffect(() => {
+    if (!remaining && !expiredRefresh.current) {
+      expiredRefresh.current = true;
+      request.current++;
+      setData(null);
+      void onRefresh();
+    }
+  }, [remaining, onRefresh]);
+  useEffect(() => {
+    const id = data?.code_request?.id;
+    if (
+      active &&
+      id &&
+      !data.can_request_code &&
+      !retrySeconds &&
+      retryRefresh.current !== id
+    ) {
+      retryRefresh.current = id;
+      void load(true);
+    }
+  }, [active, data, retrySeconds, load]);
+  const support = supportURL(data?.support_url || config?.support_url);
+  async function requestCode() {
+    if (!active || !data?.can_request_code || retrySeconds || locked.current)
+      return;
+    locked.current = true;
+    const version = request.current;
     setBusy(true);
     setError("");
     try {
-      setData(
-        await api<Activation>(
-          `/orders/${encodeURIComponent(order.id)}/items/${encodeURIComponent(item.app_slug)}/activation`,
-        ),
-      );
+      const next = await api<ActivationRequestState>(`${path}/code-request`, {
+        method: "POST",
+      });
+      if (request.current === version)
+        setData((previous) => (previous ? { ...previous, ...next } : null));
     } catch (cause) {
-      setError(message(cause));
+      if (request.current === version) {
+        setError(message(cause));
+        if (
+          cause instanceof ApiError &&
+          (cause.status === 403 || cause.status === 409 || cause.status === 410)
+        ) {
+          setData(null);
+          void onRefresh();
+        }
+      }
     } finally {
-      setBusy(false);
+      locked.current = false;
+      if (request.current === version) setBusy(false);
     }
-  }, [order.id, item.app_slug]);
-  useEffect(() => {
-    void load();
-  }, [load]);
-  const support = supportURL(data?.support_url || config?.support_url);
+  }
   async function complete() {
+    if (!active || locked.current) return;
+    locked.current = true;
     setBusy(true);
     setError("");
     try {
       await onComplete();
     } catch (cause) {
       setError(message(cause));
+      if (
+        cause instanceof ApiError &&
+        (cause.status === 403 || cause.status === 409 || cause.status === 410)
+      ) {
+        setData(null);
+        void onRefresh();
+      }
     } finally {
+      locked.current = false;
       setBusy(false);
     }
   }
   return (
     <div className="surface activation-panel">
       <h2>Активируйте приложение</h2>
-      {busy && !data ? <Skeleton /> : null}
-      {error && (
+      {active && <AccessDeadline activation deadline={expiresAt} now={now} />}
+      {suspended ? (
+        <Skeleton />
+      ) : !active ? (
+        <Notice>
+          Время на активацию истекло. Для новой установки оформите отдельную
+          покупку в каталоге.
+        </Notice>
+      ) : (
         <>
-          <Notice tone="error">{error}</Notice>
-          {!data && (
-            <Button secondary onClick={load}>
-              Повторить
+          {busy && !data ? <Skeleton /> : null}
+          {error && <Notice tone="error">{error}</Notice>}
+          {!data && !busy && (
+            <Button secondary onClick={() => load()}>
+              Обновить доступ
             </Button>
           )}
-        </>
-      )}
-      {data && (
-        <>
-          <p className="preserve-lines">{data.instructions}</p>
-          {data.mode === "credentials" && (
+          {data && (
             <>
-              {data.apple_id && (
-                <SecretField label="Apple Account" value={data.apple_id} />
+              <p className="preserve-lines">{data.instructions}</p>
+              {data.mode === "credentials" && (
+                <>
+                  {data.apple_id && (
+                    <SecretField label="Apple Account" value={data.apple_id} />
+                  )}
+                  {data.password && (
+                    <SecretField
+                      label="Пароль"
+                      value={data.password}
+                      password
+                    />
+                  )}
+                  <Notice>
+                    Входите только в App Store («Контент и покупки»). Основной
+                    iCloud менять не нужно. Код подтверждения вводите только в
+                    системном окне Apple.
+                  </Notice>
+                </>
               )}
-              {data.password && (
-                <SecretField label="Пароль" value={data.password} password />
+              <Button
+                className="full"
+                secondary
+                busy={busy}
+                disabled={!data.can_request_code || retrySeconds > 0}
+                onClick={requestCode}
+              >
+                {retrySeconds
+                  ? `Новый запрос через ${countdown(retrySeconds).slice(3)}`
+                  : data.code_request?.status === "manual_required"
+                    ? "Запросить новый код"
+                    : "Запросить код"}
+              </Button>
+              {data.code_request?.status === "manual_required" && (
+                <Notice>
+                  Запрос сохранён. Напишите в поддержку, чтобы получить код.
+                </Notice>
               )}
-              <Notice>
-                Входите только в App Store («Контент и покупки»). Основной
-                iCloud менять не нужно. Код подтверждения вводите только в
-                системном окне Apple.
-              </Notice>
+              {support ? (
+                <a
+                  className="button secondary full"
+                  href={support}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Написать в поддержку <Icon name="external" size={17} />
+                </a>
+              ) : (
+                <p className="muted small-text">
+                  Канал поддержки ещё настраивается.
+                </p>
+              )}
+              <p className="muted small-text">
+                Код передаётся вручную через поддержку. Если он уже не подходит,
+                запросите новый. Повторный запрос не продлевает время активации.
+              </p>
+              <Button className="full" busy={busy} onClick={complete}>
+                Приложение запустилось <Icon name="check" size={18} />
+              </Button>
+              <p className="muted small-text">
+                Нажмите после успешного запуска. Этот шаг сохраняет вашу отметку
+                о завершении.
+              </p>
             </>
           )}
-          {support ? (
-            <a
-              className="button secondary full"
-              href={support}
-              target="_blank"
-              rel="noreferrer"
-            >
-              Написать в поддержку <Icon name="external" size={17} />
-            </a>
-          ) : data.mode === "manual" ? (
-            <p className="muted small-text">
-              Канал поддержки ещё настраивается.
-            </p>
-          ) : null}
-          <Button className="full" busy={busy} onClick={complete}>
-            Приложение запустилось <Icon name="check" size={18} />
-          </Button>
-          <p className="muted small-text">
-            Нажмите после успешного запуска. Этот шаг сохраняет вашу отметку о
-            завершении.
-          </p>
         </>
       )}
     </div>
@@ -966,10 +1180,9 @@ function OrderPage({
   const [grant, setGrant] = useState<Grant | null>(null);
   const [grantBusy, setGrantBusy] = useState(false);
   const [grantError, setGrantError] = useState("");
-  const [step, setStep] = useState<"install" | "activate">("install");
-  const [showInstructions, setShowInstructions] = useState(false);
-  const initialized = useRef(false);
+  const [accessFresh, setAccessFresh] = useState(true);
   const loadingPayment = useRef(false);
+  const stateVersion = useRef(0);
   const load = useCallback(
     async (quiet = false) => {
       if (!user || !id || loadingPayment.current) {
@@ -978,8 +1191,10 @@ function OrderPage({
       }
       loadingPayment.current = true;
       if (!quiet) setChecking(true);
+      const version = stateVersion.current;
       try {
         const fresh = await api<Order>(`/orders/${encodeURIComponent(id)}`);
+        if (version !== stateVersion.current) return;
         setOrder(fresh);
         recordOrder(fresh);
         setError("");
@@ -987,13 +1202,7 @@ function OrderPage({
           navigate("/orders");
           toast("Оплата подтверждена. Можно устанавливать приложения.");
         }
-        if (!initialized.current) {
-          const selected =
-            orderItems(fresh).find((item) => item.app_slug === slug) ??
-            orderItems(fresh)[0];
-          setStep(selected.installed ? "activate" : "install");
-          initialized.current = true;
-        }
+        setAccessFresh(true);
       } catch (cause) {
         setError(message(cause));
       } finally {
@@ -1076,6 +1285,47 @@ function OrderPage({
   const selected =
     items.find((item) => item.app_slug === slug) ??
     (items.length === 1 ? items[0] : null);
+  const now = useServerNow(selected?.server_now || items[0]?.server_now || "");
+  const access = selected ? itemAccess(selected, now) : "unavailable";
+  const accessRef = useRef({ selected, now, fresh: accessFresh });
+  accessRef.current = { selected, now, fresh: accessFresh };
+  useEffect(() => {
+    if (order?.status !== "succeeded") return;
+    const refresh = () => {
+      setAccessFresh(false);
+      setGrant(null);
+      if (document.visibilityState === "visible") void load(true);
+    };
+    const timer = window.setInterval(() => {
+      if (
+        document.visibilityState === "visible" &&
+        items.some(
+          (item) =>
+            item.access_status === "install" ||
+            item.access_status === "activate",
+        )
+      )
+        void load(true);
+    }, 15000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [order?.status, items, load]);
+  useEffect(() => {
+    if (access !== "install") setGrant(null);
+  }, [access]);
+  function installationAllowed() {
+    const current = accessRef.current;
+    return (
+      current.fresh &&
+      current.selected &&
+      itemAccess(current.selected, current.now) === "install"
+    );
+  }
   async function markState(update: {
     installed?: boolean;
     activated?: boolean;
@@ -1091,20 +1341,24 @@ function OrderPage({
         item.app_slug === next.app_slug ? next : item,
       ),
     };
+    stateVersion.current++;
+    setAccessFresh(true);
     setOrder(changed);
     recordOrder(changed);
-    if (update.installed) setStep("activate");
+    if (update.installed) setGrant(null);
     if (update.activated) {
-      setShowInstructions(false);
       toast(`${next.app_title} — активация завершена.`);
     }
   }
   async function installLink() {
-    if (!order || !selected || grantBusy) return;
+    if (!order || !selected || grantBusy || !installationAllowed()) return;
     setGrantBusy(true);
     setGrantError("");
     try {
-      if (grant && Date.parse(grant.expires_at) > Date.now()) {
+      if (
+        grant &&
+        remainingSeconds(grant.expires_at, accessRef.current.now) > 0
+      ) {
         external(grant.url);
         return;
       }
@@ -1117,15 +1371,22 @@ function OrderPage({
         throw new Error(
           "Сервер вернул некорректную ссылку установки. Обратитесь в поддержку.",
         );
+      if (!installationAllowed()) return;
       setGrant(next);
       external(url);
     } catch (cause) {
       setGrantError(message(cause));
+      if (
+        cause instanceof ApiError &&
+        (cause.status === 409 || cause.status === 410)
+      )
+        void load(true);
     } finally {
       setGrantBusy(false);
     }
   }
   async function installed() {
+    if (!installationAllowed() || grantBusy) return;
     setGrantBusy(true);
     setGrantError("");
     try {
@@ -1137,8 +1398,8 @@ function OrderPage({
     }
   }
   async function copyLink() {
-    if (!grant) return;
-    if (Date.parse(grant.expires_at) <= Date.now()) {
+    if (!grant || !installationAllowed()) return;
+    if (!remainingSeconds(grant.expires_at, accessRef.current.now)) {
       setGrant(null);
       toast("Ссылка истекла. Нажмите «Установить приложение».");
       return;
@@ -1325,30 +1586,22 @@ function OrderPage({
         </div>
         <div className="orders-list">
           {items.map((item) => (
-            <button
-              type="button"
-              className="order-row"
-              key={item.app_slug}
-              onClick={() => navigate(routeForItem(order.id, item.app_slug))}
-            >
-              <AppIcon slug={item.app_slug} title={item.app_title} />
-              <div className="order-row-info">
-                <strong>{item.app_title}</strong>
-                <span>
-                  {item.activated
-                    ? "Активировано"
-                    : item.installed
-                      ? "Нужна активация"
-                      : "Установить и активировать"}
-                </span>
-              </div>
-              <Icon name="chevronRight" size={18} />
-            </button>
+            <PurchasedAppRow
+              key={`${order.id}:${item.app_slug}`}
+              order={order}
+              item={item}
+              navigate={navigate}
+            />
           ))}
         </div>
       </section>
     );
-  const hasValidGrant = grant && Date.parse(grant.expires_at) > Date.now();
+  const hasValidGrant =
+    grant &&
+    remainingSeconds(grant.expires_at, now) > 0 &&
+    access === "install";
+  const expired =
+    access === "install_expired" || access === "activation_expired";
   return (
     <section>
       <Back label="Мои приложения" to="/orders" />
@@ -1356,39 +1609,63 @@ function OrderPage({
         <AppIcon slug={selected.app_slug} title={selected.app_title} large />
         <div>
           <h1>{selected.app_title}</h1>
-          <p>
-            {selected.activated
-              ? "Активировано"
-              : selected.installed
-                ? "Приложение установлено"
-                : "Доступ приобретён"}
-          </p>
+          <p>{accessLabel(access)}</p>
         </div>
       </div>
       {error && <Notice tone="error">{error}</Notice>}
-      {!selected.can_install ? (
-        <Notice>
-          Платёж подтверждён, но установка пока недоступна. Обратитесь в
-          поддержку.
-        </Notice>
-      ) : selected.activated && !showInstructions ? (
+      {!accessFresh ? (
+        <div className="surface">
+          <p>Обновите доступ, чтобы продолжить.</p>
+          <Button className="full" busy={checking} onClick={() => load(true)}>
+            Обновить доступ
+          </Button>
+        </div>
+      ) : access === "completed" ? (
         <div className="surface">
           <Icon name="check" size={28} />
           <h2>Всё готово</h2>
           <p>Вы отметили приложение установленным и активированным.</p>
-          <Button className="full" onClick={() => navigate("/orders")}>
-            Мои приложения <Icon name="arrow" size={18} />
-          </Button>
+          <p>
+            Для другого устройства или новой установки оформите отдельную
+            покупку.
+          </p>
           <Button
             className="full"
-            secondary
-            onClick={() => {
-              setStep("install");
-              setShowInstructions(true);
-            }}
+            onClick={() =>
+              navigate(`/apps/${encodeURIComponent(selected.app_slug)}`)
+            }
           >
-            Инструкция по переустановке
+            Купить ещё раз <Icon name="arrow" size={18} />
           </Button>
+        </div>
+      ) : expired || access === "unavailable" ? (
+        <div className="surface">
+          <h2>{accessLabel(access)}</h2>
+          <p>
+            {expired
+              ? "Окно этой покупки закрылось. Для новой установки оформите отдельную покупку в каталоге."
+              : "Не удалось открыть доступ к приложению. Обратитесь в поддержку."}
+          </p>
+          {expired && (
+            <Button
+              className="full"
+              onClick={() =>
+                navigate(`/apps/${encodeURIComponent(selected.app_slug)}`)
+              }
+            >
+              Купить ещё раз <Icon name="arrow" size={18} />
+            </Button>
+          )}
+          {support && (
+            <a
+              className="button secondary full"
+              href={support}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Написать в поддержку
+            </a>
+          )}
         </div>
       ) : (
         <>
@@ -1399,32 +1676,30 @@ function OrderPage({
           >
             <button
               type="button"
-              aria-current={step === "install" ? "step" : undefined}
+              aria-current={access === "install" ? "step" : undefined}
               data-done={selected.installed}
-              onClick={() => setStep("install")}
+              disabled={selected.installed}
             >
               <span>1</span>Установка
             </button>
             <button
               type="button"
               disabled={!selected.installed}
-              aria-current={step === "activate" ? "step" : undefined}
-              onClick={() => setStep("activate")}
+              aria-current={access === "activate" ? "step" : undefined}
             >
               <span>2</span>Активация
             </button>
           </div>
-          {step === "install" ? (
+          {access === "install" ? (
             <div className="surface installation-panel">
               <h2>Установите приложение</h2>
+              <AccessDeadline
+                deadline={selected.install_expires_at}
+                now={now}
+              />
               <p>Подтвердите установку в системном окне на iPhone.</p>
-              <p className="muted small-text">
-                Перед переустановкой сохраните настройки существующей копии
-                приложения.
-              </p>
               <Button className="full" busy={grantBusy} onClick={installLink}>
-                Установить приложение
-                <Icon name="arrow" size={17} />
+                Установить приложение <Icon name="arrow" size={17} />
               </Button>
               {hasValidGrant && (
                 <div className="grant">
@@ -1441,25 +1716,25 @@ function OrderPage({
                 </div>
               )}
               {grantError && <Notice tone="error">{grantError}</Notice>}
-              {(grant || selected.installed) && (
-                <Button
-                  className="full"
-                  secondary
-                  busy={grantBusy}
-                  onClick={installed}
-                >
-                  {selected.installed
-                    ? "Перейти к активации"
-                    : "Приложение установлено"}
-                  <Icon name="check" size={18} />
-                </Button>
-              )}
+              <Button
+                className="full"
+                secondary
+                busy={grantBusy}
+                onClick={installed}
+              >
+                Приложение установлено <Icon name="check" size={18} />
+              </Button>
+              <p className="muted small-text">
+                Нажмите после установки. Ссылка закроется, и начнутся 6 часов на
+                активацию.
+              </p>
             </div>
           ) : (
             <ActivationPanel
               key={`${order.id}:${selected.app_slug}`}
               order={order}
               item={selected}
+              onRefresh={load}
               onComplete={() => markState({ activated: true })}
             />
           )}
@@ -1476,11 +1751,11 @@ const questions = [
   ],
   [
     "Нужен ли компьютер или провод?",
-    "Достаточно iPhone и Safari. Персональная установочная ссылка действует ограниченное время. Новую ссылку можно получить в оплаченном заказе.",
+    "Достаточно iPhone и Safari. Установите приложение в течение 12 часов после оплаты. После отметки «Приложение установлено» ссылка закрывается и начинается 6-часовое окно активации.",
   ],
   [
     "Почему приложение не открывается?",
-    "После установки может понадобиться активация. Откройте приложение в «Моих приложениях», перейдите к шагу «Активация» и следуйте инструкции. Если нужна помощь, сообщите поддержке название приложения, версию iOS и текст ошибки.",
+    "После отметки об установке у вас есть 6 часов на активацию. Запросите код на шаге «Активация» и напишите в поддержку: сейчас код передаётся вручную. Если код уже не подходит, можно запросить новый; окно активации не продлевается.",
   ],
   [
     "Нужно ли выходить из iCloud?",
@@ -1488,7 +1763,7 @@ const questions = [
   ],
   [
     "Можно ли вернуться в свой аккаунт?",
-    "После успешного запуска можно вернуться в собственный аккаунт App Store. Совместимость зависит от версии iOS и приложения. Обновление или повторная установка могут потребовать повторную авторизацию.",
+    "После успешного запуска можно вернуться в собственный аккаунт App Store. Одна покупка даёт одну установку и активацию. Для другого устройства или новой установки оформите отдельную покупку; прежние покупки сохранятся в «Моих приложениях».",
   ],
   [
     "Что делать, если приложение уже установлено?",
@@ -1650,14 +1925,16 @@ export default function App() {
           (a, b) => b.created_at.localeCompare(a.created_at),
         );
       });
-      if (order.status !== "pending")
+      const finishedAttempt =
+        order.status !== "pending" &&
         clearPurchaseRequest(
           cartRequestKey(
             orderItems(order).map((item) => item.app_slug),
             order.test ? "test" : "live",
           ),
+          order.id,
         );
-      if (order.status === "succeeded") {
+      if (order.status === "succeeded" && finishedAttempt) {
         const purchased = orderItems(order).map((item) => item.app_slug);
         updateCart(cartRef.current.filter((slug) => !purchased.includes(slug)));
       }
@@ -1752,10 +2029,7 @@ export default function App() {
     (slug: string) => {
       if (
         !cartReady ||
-        !apps.some((app) => app.slug === slug && canPurchaseApp(app)) ||
-        purchasedApps(orders, config?.payments_mode ?? "test").some(
-          (entry) => entry.item.app_slug === slug,
-        )
+        !apps.some((app) => app.slug === slug && canPurchaseApp(app))
       )
         return;
       const selected = cartRef.current.includes(slug);
@@ -1765,7 +2039,7 @@ export default function App() {
           : [...cartRef.current, slug],
       );
     },
-    [apps, cartReady, orders, config?.payments_mode, updateCart],
+    [apps, cartReady, updateCart],
   );
   const checkout = useCallback(
     (anchor?: HTMLElement) => {
@@ -1913,19 +2187,6 @@ export default function App() {
     updateCart(ids);
     setCartReady(true);
   }, [authReady, user?.id, loading, apps, updateCart]);
-  useEffect(() => {
-    const owned = purchasedApps(orders, config?.payments_mode ?? "test").map(
-      (entry) => entry.item.app_slug,
-    );
-    const next = cartRef.current.filter((slug) => !owned.includes(slug));
-    if (next.length !== cartRef.current.length) updateCart(next);
-    setSelection((previous) => {
-      if (!previous || !previous.some((app) => owned.includes(app.slug)))
-        return previous;
-      const remaining = previous.filter((app) => !owned.includes(app.slug));
-      return remaining.length ? remaining : null;
-    });
-  }, [orders, config?.payments_mode, updateCart]);
   useEffect(() => {
     const scroll = main.current;
     if (!scroll || lastPath.current === path) return;

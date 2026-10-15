@@ -50,10 +50,37 @@ export interface OrderItem {
   installed: boolean;
   activated: boolean;
   can_install: boolean;
+  can_activate: boolean;
+  can_request_code: boolean;
+  server_now: string;
+  install_expires_at: string | null;
+  activation_expires_at: string | null;
+  access_status: AccessStatus;
   installed_at?: string | null;
   activated_at?: string | null;
 }
-export interface Activation {
+export type AccessStatus =
+  | "install"
+  | "activate"
+  | "completed"
+  | "install_expired"
+  | "activation_expired"
+  | "unavailable";
+export interface CodeRequest {
+  id: string | null;
+  status: "not_requested" | "manual_required";
+  requested_at: string | null;
+  retry_at: string | null;
+  retry_after: number;
+  expires_at: string;
+}
+export interface ActivationRequestState {
+  server_now: string;
+  activation_expires_at: string;
+  can_request_code: boolean;
+  code_request: CodeRequest;
+}
+export interface Activation extends ActivationRequestState {
   mode: "manual" | "credentials";
   apple_id?: string;
   password?: string;

@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS artifact_snapshots (
  id TEXT PRIMARY KEY, record_json TEXT NOT NULL,
  legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1))
 );
+CREATE TABLE IF NOT EXISTS activation_code_requests (
+ id TEXT PRIMARY KEY, order_id TEXT NOT NULL, app_slug TEXT NOT NULL,
+ requested_at INTEGER NOT NULL,
+ FOREIGN KEY(order_id,app_slug) REFERENCES order_items(order_id,app_slug)
+);
+CREATE INDEX IF NOT EXISTS code_requests_item ON activation_code_requests(order_id,app_slug,requested_at);
 '''
 
 

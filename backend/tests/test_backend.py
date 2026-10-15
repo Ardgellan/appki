@@ -10,6 +10,9 @@ import sqlite3
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from types import SimpleNamespace
 from urllib.parse import urlencode, urlsplit
 import zipfile
 
@@ -156,6 +159,13 @@ def settle_order(client, fake, result):
     assert response.status_code == 200
 
 
+def mark_installed(client, owner, order_id, slug='happ'):
+    response = client.patch(f'/api/orders/{order_id}/items/{slug}/state', headers=owner,
+                            json={'installed': True})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def profile_fixture(cfg, profiles):
     cfg.activation_profiles_path.write_text(json.dumps({'profiles': profiles}))
     cfg.activation_profiles_path.chmod(0o600)
@@ -277,7 +287,7 @@ def test_paid_duplicate_events_and_refund_revoke_existing_grant(configured):
     event = {'event':'payment.succeeded','object':{'id':payment_id}}
     assert client.post('/api/payments/yookassa/webhook', json=event).status_code == 200
     assert client.get(path).status_code == 200
-    assert client.get(f"/api/orders/{result['id']}/activation", headers=headers).json()['mode'] == 'manual'
+    assert client.get(f"/api/orders/{result['id']}/activation", headers=headers).status_code == 409
     fake.values[payment_id]['refunded_amount'] = {'value':'1.00','currency':'RUB'}
     event = {'event':'refund.succeeded','object':{'id':str(uuid.uuid4()),'payment_id':payment_id}}
     assert client.post('/api/payments/yookassa/webhook', json=event).status_code == 200
@@ -397,6 +407,7 @@ def test_credentials_only_visible_to_paid_owner(configured):
     path = f"/api/orders/{result['id']}/activation"
     assert client.get(path).status_code == 401
     assert client.get(path, headers=outsider).status_code == 404
+    mark_installed(client, owner, result['id'])
     response = client.get(path, headers=owner)
     assert response.json()['password'] == cfg.activation_password
     assert 'no-store' in response.headers['cache-control']
@@ -448,9 +459,13 @@ def test_cart_checkout_preserves_legacy_contract_and_rejects_invalid_items(confi
     result = response.json()
     assert result['app_slug'] == 'happ' and result['app_title'] == 'Happ'
     assert result['amount_rub'] == result['total_rub'] == '1.00'
-    assert result['items'] == [{'app_slug': 'happ', 'app_title': 'Happ', 'amount_rub': '1.00',
-                                'installed': False, 'activated': False, 'installed_at': None,
-                                'activated_at': None, 'can_install': False}]
+    item = result['items'][0]
+    assert {key: item[key] for key in ('app_slug', 'app_title', 'amount_rub', 'installed', 'activated',
+                                      'installed_at', 'activated_at', 'can_install')} == {
+        'app_slug': 'happ', 'app_title': 'Happ', 'amount_rub': '1.00', 'installed': False,
+        'activated': False, 'installed_at': None, 'activated_at': None, 'can_install': False}
+    assert item['server_now'] and item['access_status'] == 'unavailable'
+    assert item['install_expires_at'] is item['activation_expires_at'] is None
     assert order(client, headers, 'cart-checkout')['id'] == result['id']
     assert len(fake.keys) == 1
     for selection in [{}, {'app_slugs': []}, {'app_slugs': ['happ', 'happ']},
@@ -506,22 +521,21 @@ def test_item_steps_are_owner_reported_paid_only_and_idempotent(configured):
     fake.values[payment_id].update(status='succeeded', paid=True)
     client.post('/api/payments/yookassa/webhook', json={'event': 'payment.succeeded', 'object': {'id': payment_id}})
     assert client.post(base+'/install-link', headers=owner).status_code == 200
-    assert client.get(base+'/activation', headers=owner).json()['mode'] == 'manual'
+    assert client.get(base+'/activation', headers=owner).status_code == 409
     assert not client.get(f"/api/orders/{result['id']}", headers=owner).json()['items'][0]['installed']
     assert client.patch(base+'/state', headers=owner, json={'activated': True}).status_code == 409
     installed = client.patch(base+'/state', headers=owner, json={'installed': True}).json()
     assert installed['installed'] and not installed['activated']
+    assert client.get(base+'/activation', headers=owner).json()['mode'] == 'manual'
     assert client.patch(base+'/state', headers=owner, json={'installed': True}).json()['installed_at'] == installed['installed_at']
     activated = client.patch(base+'/state', headers=owner, json={'activated': True}).json()
     assert activated['installed'] and activated['activated'] and activated['activated_at']
     assert client.patch(base+'/state', headers=owner, json={'activated': True}).json()['activated_at'] == activated['activated_at']
     assert client.get('/api/orders', headers=owner).json()['items'][0]['items'][0]['activated']
-    reset = client.patch(base+'/state', headers=owner, json={'installed': False}).json()
-    assert not reset['installed'] and not reset['activated']
-    assert reset['installed_at'] is None and reset['activated_at'] is None
+    for reset in [{'installed': False}, {'activated': False}, {'installed': False, 'activated': True}]:
+        assert client.patch(base+'/state', headers=owner, json=reset).status_code == 409
     assert client.patch(base+'/state', headers=owner, json={'installed': True, 'activated': True}).json()['activated']
-    for body in [{}, {'installed': None}, {'installed': 1}, {'activated': 'true'},
-                 {'installed': False, 'activated': True}]:
+    for body in [{}, {'installed': None}, {'installed': 1}, {'activated': 'true'}]:
         assert client.patch(base+'/state', headers=owner, json=body).status_code == 422
     assert client.patch(base+'/state', json={'installed': True}).status_code == 401
     assert client.post(base+'/install-link', headers=outsider).status_code == 404
@@ -580,6 +594,8 @@ def test_multi_item_checkout_has_one_payment_and_independent_steps_and_files(con
             metadata = plistlib.loads(client.get(paths[slug]+'/manifest.plist').content)['items'][0]['metadata']
             assert metadata['bundle-identifier'] == ('su.ffg.happ' if slug == 'happ' else 'test.fixture.second')
             assert metadata['title'] == catalog[slug]['title']
+        assert client.get(base+'/items/second/activation', headers=headers).status_code == 409
+        mark_installed(client, headers, result['id'], 'second')
         assert client.get(base+'/items/second/activation', headers=headers).status_code == 200
         client.patch(base+'/items/second/state', headers=headers, json={'installed': True, 'activated': True})
         items = client.get(base, headers=headers).json()['items']
@@ -966,14 +982,15 @@ def test_planned_listing_cannot_serve_installation_even_if_referenced_by_a_paid_
     with app.state.db.connection(write=True) as conn:
         conn.execute('UPDATE order_items SET app_slug=?,app_title=? WHERE order_id=?',
                      ('chatgpt', 'ChatGPT', purchased['id']))
+        conn.execute('UPDATE order_items SET installed_at=? WHERE order_id=?', (int(time.time()), purchased['id']))
         conn.execute('UPDATE install_grants SET app_slug=? WHERE order_id=?', ('chatgpt', purchased['id']))
     base = f"/api/orders/{purchased['id']}/items/chatgpt"
     result = client.get(f"/api/orders/{purchased['id']}", headers=owner).json()
     assert not result['can_install'] and not result['items'][0]['can_install']
-    assert client.post(base+'/install-link', headers=owner).status_code == 503
+    assert client.post(base+'/install-link', headers=owner).status_code == 409
     assert client.get(base+'/activation', headers=owner).status_code == 503
     for suffix in ['', '/manifest.plist', '/app.ipa']:
-        assert client.get(path+suffix).status_code == 503
+        assert client.get(path+suffix).status_code == 410
     with app.state.db.connection() as conn:
         assert conn.execute('SELECT COUNT(*) FROM install_grants').fetchone()[0] == 1
     assert len(fake.keys) == 1
@@ -990,7 +1007,6 @@ def test_legacy_grants_keep_original_file_and_activation_after_publish_and_resta
                                         'apple_id': 'new@example.test', 'password': 'new-secret'}})
     assert client.get('/api/apps/happ').json()['version'] == '2.0'
     assert client.get(path+'/app.ipa').content == original != replacement
-    assert client.get(f"/api/orders/{purchased['id']}/activation", headers=owner).json()['password'] == 'legacy-secret'
     again = client.post(f"/api/orders/{purchased['id']}/install-link", headers=owner)
     assert client.get(urlsplit(again.json()['url']).path+'/app.ipa').content == original
     with app.state.db.connection() as conn:
@@ -1001,12 +1017,15 @@ def test_legacy_grants_keep_original_file_and_activation_after_publish_and_resta
     with TestClient(create_app(cfg, payment_client=fake)) as restarted:
         assert restarted.get('/api/apps/happ').json()['version'] == '2.0'
         assert restarted.get(path+'/app.ipa').content == original
+        mark_installed(restarted, owner, purchased['id'])
         assert restarted.get(f"/api/orders/{purchased['id']}/activation", headers=owner).json()['apple_id'] == 'legacy@example.test'
+        assert restarted.get(path+'/app.ipa').status_code == 410
+        assert restarted.post(f"/api/orders/{purchased['id']}/install-link", headers=owner).status_code == 409
         order_response = restarted.get(f"/api/orders/{purchased['id']}", headers=owner).json()
         assert order_response['status'] == 'succeeded' and order_response['amount_rub'] == '1.00'
 
 
-def test_imported_order_item_pins_release_and_account_on_first_activation(configured, tmp_path):
+def test_imported_order_item_pins_release_and_account_through_installation(configured, tmp_path):
     cfg, fake, app, client = configured
     first, first_bytes = release_fixture(cfg, tmp_path)
     profile_fixture(cfg, {
@@ -1017,26 +1036,27 @@ def test_imported_order_item_pins_release_and_account_on_first_activation(config
     purchased = order(client, owner, 'first-artifact-order')
     settle_order(client, fake, purchased)
     base = f"/api/orders/{purchased['id']}/items/happ"
-    assert client.get(base+'/activation', headers=owner).json()['password'] == 'secret-a'
-    second, second_bytes = release_fixture(cfg, tmp_path, account='account-b', profile='profile-b', version='3.0')
-    assert client.get('/api/apps/happ').json()['version'] == '3.0'
     install = client.post(base+'/install-link', headers=owner)
     path = urlsplit(install.json()['url']).path
+    second, second_bytes = release_fixture(cfg, tmp_path, account='account-b', profile='profile-b', version='3.0')
+    assert client.get('/api/apps/happ').json()['version'] == '3.0'
     assert client.get(path+'/app.ipa').content == first_bytes != second_bytes
+    mark_installed(client, owner, purchased['id'])
     assert client.get(base+'/activation', headers=owner).json()['apple_id'] == 'a@example.test'
     with app.state.db.connection() as conn:
         assert conn.execute('SELECT artifact_id FROM order_items WHERE order_id=?', (purchased['id'],)).fetchone()[0] == first['id']
         assert conn.execute('SELECT artifact_id FROM install_grants WHERE order_id=?', (purchased['id'],)).fetchone()[0] == first['id']
     with TestClient(create_app(cfg, payment_client=fake)) as restarted:
-        assert restarted.get(path+'/app.ipa').content == first_bytes
+        assert restarted.get(path+'/app.ipa').status_code == 410
         assert restarted.get(base+'/activation', headers=owner).json()['password'] == 'secret-a'
         newcomer = login(restarted, 222)
         latest = order(restarted, newcomer, 'latest-artifact-order')
         settle_order(restarted, fake, latest)
         latest_base = f"/api/orders/{latest['id']}/items/happ"
-        assert restarted.get(latest_base+'/activation', headers=newcomer).json()['password'] == 'secret-b'
         newest = restarted.post(latest_base+'/install-link', headers=newcomer)
         assert restarted.get(urlsplit(newest.json()['url']).path+'/app.ipa').content == second_bytes
+        mark_installed(restarted, newcomer, latest['id'])
+        assert restarted.get(latest_base+'/activation', headers=newcomer).json()['password'] == 'secret-b'
         assert first['id'] != second['id']
 
 
@@ -1069,9 +1089,10 @@ def test_mixed_app_artifacts_keep_distinct_accounts_and_never_leak_private_catal
     for slug, expected, password in [('happ', happ_bytes, 'secret-a'), ('v2raytun', v2_bytes, 'secret-b')]:
         base = f"/api/orders/{purchased['id']}/items/{slug}"
         assert client.get(base+'/activation', headers=outsider).status_code == 404
-        assert client.get(base+'/activation', headers=owner).json()['password'] == password
         link = client.post(base+'/install-link', headers=owner)
         assert client.get(urlsplit(link.json()['url']).path+'/app.ipa').content == expected
+        mark_installed(client, owner, purchased['id'], slug)
+        assert client.get(base+'/activation', headers=owner).json()['password'] == password
     public_order = json.dumps(client.get(f"/api/orders/{purchased['id']}", headers=owner).json())
     assert 'private-account' not in public_order and 'private-profile' not in public_order and 'artifact_id' not in public_order
 
@@ -1089,6 +1110,7 @@ def test_imported_artifact_activation_never_inherits_global_legacy_credentials(c
     owner = login(client)
     purchased = order(client, owner, 'activation-account-order')
     settle_order(client, fake, purchased)
+    mark_installed(client, owner, purchased['id'])
     response = client.get(f"/api/orders/{purchased['id']}/items/happ/activation", headers=owner)
     assert 'legacy-private' not in response.text
     if configured_profile == 'wrong_account':
@@ -1129,7 +1151,7 @@ def test_new_reported_steps_do_not_acquire_legacy_activation_on_restart(configur
     purchased = order(client, owner, 'new-reported-state')
     settle_order(client, fake, purchased)
     client.patch(f"/api/orders/{purchased['id']}/items/happ/state", headers=owner,
-                 json={'installed': True, 'activated': True})
+                 json={'installed': True})
     with TestClient(create_app(cfg, payment_client=fake)) as restarted:
         result = restarted.get(f"/api/orders/{purchased['id']}/items/happ/activation", headers=owner)
         assert result.status_code == 200 and result.json()['mode'] == 'manual'
@@ -1146,6 +1168,7 @@ def test_pinned_account_cannot_be_reassigned_through_a_profile_or_snapshot(confi
     owner = login(client)
     purchased = order(client, owner, 'immutable-account-order')
     settle_order(client, fake, purchased)
+    mark_installed(client, owner, purchased['id'])
     path = f"/api/orders/{purchased['id']}/items/happ/activation"
     assert client.get(path, headers=owner).json()['password'] == 'secret-a'
     profile_fixture(cfg, {'profile-a': {'mode': 'credentials', 'account_id': 'account-b',
@@ -1159,3 +1182,239 @@ def test_pinned_account_cannot_be_reassigned_through_a_profile_or_snapshot(confi
         conn.execute('UPDATE artifact_snapshots SET record_json=? WHERE id=?', (json.dumps(altered), imported['id']))
     response = client.get(path, headers=owner)
     assert response.status_code == 503 and 'secret-b' not in response.text
+
+
+def delivery_clock(monkeypatch):
+    clock = [int(time.time())]
+    monkeypatch.setattr('appki.main.time', SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic))
+    return clock
+
+
+def timestamp(value):
+    return int(datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
+
+
+def test_install_window_uses_verified_payment_and_caps_old_grants_at_exact_deadline(configured, monkeypatch):
+    clock = delivery_clock(monkeypatch)
+    cfg, _, app, client = configured
+    owner, purchased, _, path = grant(configured)
+    paid_at = clock[0]
+    with app.state.db.connection(write=True) as conn:
+        conn.execute('UPDATE orders SET created_at=? WHERE id=?', (paid_at-2*86400, purchased['id']))
+    base = f"/api/orders/{purchased['id']}/items/happ"
+    view = client.get(f"/api/orders/{purchased['id']}", headers=owner).json()['items'][0]
+    assert timestamp(view['install_expires_at']) == paid_at+12*3600
+    assert view['activation_expires_at'] is None and view['access_status'] == 'install'
+    with app.state.db.connection(write=True) as conn:
+        conn.execute('UPDATE install_grants SET expires_at=? WHERE order_id=?',
+                     (paid_at+2*86400, purchased['id']))
+    clock[0] = paid_at+12*3600-10
+    fresh = client.post(base+'/install-link', headers=owner)
+    assert fresh.status_code == 200
+    assert timestamp(fresh.json()['expires_at']) == paid_at+12*3600
+    # Older code/configuration may have created a longer-lived capability.
+    with app.state.db.connection(write=True) as conn:
+        conn.execute('UPDATE install_grants SET expires_at=? WHERE order_id=?',
+                     (paid_at+2*86400, purchased['id']))
+    assert client.head(path+'/app.ipa').status_code == 200
+    assert client.get(path+'/app.ipa', headers={'Range': 'bytes=0-9'}).status_code == 206
+    assert client.get(path+'/manifest.plist').status_code == 200
+    clock[0] = paid_at+12*3600
+    for suffix in ['', '/manifest.plist', '/app.ipa']:
+        assert client.head(path+suffix).status_code == 410
+        assert client.get(path+suffix).status_code == 410
+    assert client.post(base+'/install-link', headers=owner).status_code == 410
+    assert client.patch(base+'/state', headers=owner, json={'installed': True}).status_code == 410
+    assert client.get(base+'/activation', headers=owner).status_code == 410
+    view = client.get(f"/api/orders/{purchased['id']}", headers=owner).json()['items'][0]
+    assert view['access_status'] == 'install_expired' and not view['can_install']
+    assert not view['can_activate'] and not view['can_request_code']
+
+
+def test_legacy_succeeded_without_paid_at_has_bounded_install_window(configured, monkeypatch):
+    clock = delivery_clock(monkeypatch)
+    _, _, app, client = configured
+    owner, purchased, _ = paid(configured)
+    with app.state.db.connection(write=True) as conn:
+        conn.execute('UPDATE orders SET paid_at=NULL,created_at=? WHERE id=?',
+                     (clock[0]-12*3600, purchased['id']))
+    view = client.get(f"/api/orders/{purchased['id']}", headers=owner).json()['items'][0]
+    assert timestamp(view['install_expires_at']) == clock[0]
+    assert view['access_status'] == 'install_expired'
+    assert client.post(f"/api/orders/{purchased['id']}/install-link", headers=owner).status_code == 410
+
+
+def test_installation_closes_all_caps_and_six_hour_activation_is_monotonic(configured, monkeypatch):
+    clock = delivery_clock(monkeypatch)
+    cfg, _, app, client = configured
+    cfg.activation_mode = 'credentials'
+    cfg.activation_apple_id, cfg.activation_password = 'fixture@example.test', 'fixture-private-password'
+    owner, purchased, _, first = grant(configured)
+    base = f"/api/orders/{purchased['id']}/items/happ"
+    second = urlsplit(client.post(base+'/install-link', headers=owner).json()['url']).path
+    installed = mark_installed(client, owner, purchased['id'])
+    activation_start = clock[0]
+    assert timestamp(installed['activation_expires_at']) == activation_start+6*3600
+    assert installed['access_status'] == 'activate' and installed['can_activate']
+    assert not installed['can_install'] and installed['can_request_code']
+    for path in [first, second]:
+        for suffix in ['', '/manifest.plist', '/app.ipa']:
+            assert client.get(path+suffix).status_code == 410
+            assert client.head(path+suffix).status_code == 410
+    assert client.post(base+'/install-link', headers=owner).status_code == 409
+    with app.state.db.connection() as conn:
+        assert all(row[0] == 1 for row in conn.execute('SELECT revoked FROM install_grants WHERE order_id=?',
+                                                     (purchased['id'],)))
+    clock[0] = activation_start+6*3600-1
+    assert client.get(base+'/activation', headers=owner).json()['password'] == cfg.activation_password
+    clock[0] += 1
+    repeated = client.patch(base+'/state', headers=owner, json={'installed': True}).json()
+    assert repeated['installed_at'] == installed['installed_at']
+    assert repeated['activation_expires_at'] == installed['activation_expires_at']
+    assert repeated['access_status'] == 'activation_expired'
+    assert not repeated['can_activate'] and not repeated['can_request_code']
+    for response in [client.get(base+'/activation', headers=owner),
+                     client.post(base+'/activation/code-request', headers=owner),
+                     client.patch(base+'/state', headers=owner, json={'activated': True})]:
+        assert response.status_code == 410 and cfg.activation_password not in response.text
+    for payload in [{'installed': False}, {'activated': False}]:
+        assert client.patch(base+'/state', headers=owner, json=payload).status_code == 409
+
+
+def test_completed_activation_closes_credentials_and_code_without_resetting_timestamps(configured, monkeypatch):
+    clock = delivery_clock(monkeypatch)
+    _, _, _, client = configured
+    owner, purchased, _ = paid(configured)
+    base = f"/api/orders/{purchased['id']}/items/happ"
+    completed = client.patch(base+'/state', headers=owner, json={'installed': True, 'activated': True}).json()
+    assert completed['access_status'] == 'completed'
+    assert not completed['can_install'] and not completed['can_activate'] and not completed['can_request_code']
+    clock[0] += 7*3600
+    repeated = client.patch(base+'/state', headers=owner, json={'installed': True, 'activated': True}).json()
+    assert repeated == {**completed, 'server_now': repeated['server_now']}
+    assert client.get(base+'/activation', headers=owner).status_code == 409
+    assert client.post(base+'/activation/code-request', headers=owner).status_code == 409
+    assert client.post(base+'/install-link', headers=owner).status_code == 409
+
+
+def test_manual_code_request_is_persisted_metadata_with_cooldown_and_no_window_extension(configured, monkeypatch):
+    clock = delivery_clock(monkeypatch)
+    cfg, fake, app, client = configured
+    owner, purchased, _ = paid(configured)
+    base = f"/api/orders/{purchased['id']}/items/happ"
+    assert client.post(base+'/activation/code-request', headers=owner).status_code == 409
+    installed = mark_installed(client, owner, purchased['id'])
+    activation = client.get(base+'/activation', headers=owner).json()
+    assert activation['mode'] == 'manual' and activation['can_request_code']
+    assert activation['code_request'] == {'id': None, 'status': 'not_requested', 'requested_at': None,
+        'retry_at': None, 'retry_after': 0, 'expires_at': installed['activation_expires_at']}
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT count(*) FROM activation_code_requests').fetchone()[0] == 0
+    response = client.post(base+'/activation/code-request', headers=owner).json()
+    first = response['code_request']
+    assert first['status'] == 'manual_required' and first['id']
+    assert first['retry_after'] == 60 and timestamp(first['retry_at']) == clock[0]+60
+    assert timestamp(first['requested_at']) == clock[0]
+    assert first['expires_at'] == installed['activation_expires_at']
+    assert not response['can_request_code'] and 'code' not in first and 'password' not in response
+    alias = f"/api/orders/{purchased['id']}/activation/code-request"
+    assert client.post(alias, headers=owner).json()['code_request'] == first
+    clock[0] += 59
+    retry = client.post(base+'/activation/code-request', headers=owner).json()['code_request']
+    assert retry['id'] == first['id'] and retry['retry_after'] == 1
+    clock[0] += 1
+    second = client.post(base+'/activation/code-request', headers=owner).json()['code_request']
+    assert second['id'] != first['id'] and second['expires_at'] == first['expires_at']
+    with TestClient(create_app(cfg, payment_client=fake)) as restarted:
+        restored = restarted.get(base+'/activation', headers=owner).json()
+        assert restored['code_request'] == second
+        item = restarted.get(f"/api/orders/{purchased['id']}", headers=owner).json()['items'][0]
+        assert item['installed_at'] == installed['installed_at']
+        assert item['activation_expires_at'] == installed['activation_expires_at']
+        assert not item['can_request_code']
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT count(*) FROM activation_code_requests').fetchone()[0] == 2
+        assert {row['name'] for row in conn.execute('PRAGMA table_info(activation_code_requests)')} == {
+            'id', 'order_id', 'app_slug', 'requested_at'}
+
+
+def test_code_request_guards_owner_paid_mode_refund_and_independent_items(configured):
+    cfg, fake, _, client = configured
+    owner = login(client)
+    outsider = login(client, 222)
+    purchased = order(client, owner)
+    path = f"/api/orders/{purchased['id']}/items/happ/activation/code-request"
+    assert client.post(path).status_code == 401
+    assert client.post(path, headers=outsider).status_code == 404
+    assert client.post(path, headers=owner).status_code == 403
+    settle_order(client, fake, purchased)
+    mark_installed(client, owner, purchased['id'])
+    assert client.post(path.replace('/happ/', '/other/'), headers=owner).status_code == 404
+    cfg.yookassa_mode = 'live'
+    assert client.post(path, headers=owner).status_code == 403
+    cfg.yookassa_mode = 'test'
+    payment_id = next(iter(fake.values))
+    fake.values[payment_id]['refunded_amount'] = {'value': '1.00', 'currency': 'RUB'}
+    client.post('/api/payments/yookassa/webhook', json={'event': 'refund.succeeded', 'object': {'payment_id': payment_id}})
+    assert client.post(path, headers=owner).status_code == 403
+    assert client.get(path.removesuffix('/code-request'), headers=owner).status_code == 403
+
+
+def test_code_request_schema_migration_preserves_purchases_and_foreign_keys(configured):
+    cfg, fake, app, client = configured
+    owner, purchased, _ = paid(configured)
+    installed = mark_installed(client, owner, purchased['id'])
+    with app.state.db.connection(write=True) as conn:
+        before = tuple(conn.execute('SELECT * FROM orders WHERE id=?', (purchased['id'],)).fetchone())
+        conn.execute('DROP TABLE activation_code_requests')
+    with TestClient(create_app(cfg, payment_client=fake)) as restarted:
+        current = restarted.get(f"/api/orders/{purchased['id']}", headers=owner).json()['items'][0]
+        assert current['installed_at'] == installed['installed_at']
+        assert restarted.post(f"/api/orders/{purchased['id']}/activation/code-request", headers=owner).status_code == 200
+    with app.state.db.connection() as conn:
+        assert tuple(conn.execute('SELECT * FROM orders WHERE id=?', (purchased['id'],)).fetchone()) == before
+        assert conn.execute('PRAGMA foreign_key_check').fetchall() == []
+    with pytest.raises(sqlite3.IntegrityError):
+        with app.state.db.connection(write=True) as conn:
+            conn.execute('INSERT INTO activation_code_requests VALUES (?,?,?,?)',
+                         (str(uuid.uuid4()), purchased['id'], 'unrelated-app', int(time.time())))
+
+
+def test_repeat_purchase_has_independent_payment_window_and_preserves_pending_reuse(configured, monkeypatch):
+    clock = delivery_clock(monkeypatch)
+    _, fake, _, client = configured
+    owner, first, _, first_cap = grant(configured)
+    first_item = mark_installed(client, owner, first['id'])
+    client.patch(f"/api/orders/{first['id']}/items/happ/state", headers=owner, json={'activated': True})
+    clock[0] += 1800
+    second = order(client, owner, 'second-device-purchase')
+    assert second['id'] != first['id'] and second['status'] == 'pending'
+    assert order(client, owner, 'second-device-other-click')['id'] == second['id']
+    assert len(fake.values) == 2
+    settle_order(client, fake, second)
+    fresh = client.get(f"/api/orders/{second['id']}", headers=owner).json()['items'][0]
+    assert timestamp(fresh['install_expires_at']) == timestamp(first_item['install_expires_at'])+1800
+    assert fresh['can_install'] and not fresh['installed'] and not fresh['activated']
+    link = client.post(f"/api/orders/{second['id']}/install-link", headers=owner)
+    assert link.status_code == 200
+    assert client.get(urlsplit(link.json()['url']).path+'/app.ipa').status_code == 200
+    assert client.get(first_cap+'/app.ipa').status_code == 410
+    assert order(client, owner)['id'] == first['id']
+    assert len(fake.values) == 2
+
+
+def test_concurrent_install_marks_and_manual_requests_are_idempotent(configured):
+    _, _, app, client = configured
+    owner, purchased, _ = paid(configured)
+    base = f"/api/orders/{purchased['id']}/items/happ"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        marks = list(pool.map(lambda _: client.patch(base+'/state', headers=owner, json={'installed': True}), range(2)))
+    assert all(response.status_code == 200 for response in marks)
+    assert marks[0].json()['installed_at'] == marks[1].json()['installed_at']
+    assert marks[0].json()['activation_expires_at'] == marks[1].json()['activation_expires_at']
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        requests = list(pool.map(lambda _: client.post(base+'/activation/code-request', headers=owner), range(2)))
+    assert all(response.status_code == 200 for response in requests)
+    assert requests[0].json()['code_request']['id'] == requests[1].json()['code_request']['id']
+    with app.state.db.connection() as conn:
+        assert conn.execute('SELECT count(*) FROM activation_code_requests').fetchone()[0] == 1
